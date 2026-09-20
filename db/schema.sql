@@ -1,6 +1,14 @@
 -- SanityGate pilot schema. Run this once in the Supabase SQL editor
 -- (or via `supabase db push` if you use the CLI) before deploying.
 --
+-- IMPORTANT — upgrading an existing database: every statement below uses
+-- `create table if not exists` / `create or replace function`, which are
+-- no-ops against objects that already exist. If you already have a
+-- SanityGate database from an earlier version of this schema, running
+-- this file again will NOT rename or add columns for you. Run the
+-- matching file in db/migrations/ first (see db/migrations/0001_sync_two_box_schema.sql),
+-- then re-run this file to confirm everything's in place.
+--
 -- Design notes:
 --  * No account system for the pilot — users are identified by an
 --    anonymous session_id (random UUID generated client-side and stored

@@ -42,6 +42,11 @@ npm install
 
 1. Create a free project at https://supabase.com.
 2. Open the SQL editor and run the contents of `db/schema.sql` once.
+   - **Already have a SanityGate database from an earlier version of this
+     project?** `db/schema.sql` uses `create table if not exists`, which
+     does nothing to a table that already exists — it will NOT add or
+     rename columns for you. Run `db/migrations/0001_sync_two_box_schema.sql`
+     first (safe to run once, safe to re-run), then re-run `db/schema.sql`.
 3. Under Project Settings → API, copy:
    - **Project URL** → `NEXT_PUBLIC_SUPABASE_URL`
    - **service_role key** (not the anon key) → `SUPABASE_SERVICE_ROLE_KEY`

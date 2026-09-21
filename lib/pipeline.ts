@@ -17,11 +17,16 @@ export interface Providers {
 
 /** Step 1: turn the user's free-text request into a structured, auditable
  * requirement list. Never throws for "no requirements found" — only
- * throws (LLMError) on genuine provider failure, which the caller must
- * treat as "extraction failed", not "there were no requirements". */
+ * throws (LLMError) on genuine provider failure, which the caller treats
+ * as "extraction produced nothing usable" and proceeds anyway (see
+ * runPipeline) rather than aborting the whole semantic review over it —
+ * the evaluator still receives the raw request text either way and can
+ * work from that directly. */
 async function runExtraction(provider: LLMProvider, request: string): Promise<ExtractedRequirement[]> {
   if (!request || !request.trim()) return [];
-  const data = await provider.completeJSON<ExtractionResult>(buildExtractionPrompt(request), { temperature: 0.05, maxTokens: 900 });
+  const data = await provider.completeJSON<ExtractionResult>(buildExtractionPrompt(request), {
+    temperature: 0.05, maxTokens: 1400, timeoutMs: 10000, stage: 'extraction',
+  });
   const reqs = Array.isArray(data?.requirements) ? data.requirements : [];
   const validTypes = new Set(['length', 'required_content', 'quantity', 'format', 'prohibition', 'order', 'fact']);
   return reqs.filter(r => r && validTypes.has(r.type)).map(r => ({
@@ -31,9 +36,11 @@ async function runExtraction(provider: LLMProvider, request: string): Promise<Ex
 }
 
 /** Steps 2-4: evaluator -> programmatic evidence validation -> verifier
- * (+ suggestion self-check). Throws LLMError on failure of either the
- * evaluator or verifier call; the caller must surface this explicitly
- * and never treat it as "no issues found". */
+ * (+ suggestion self-check). Throws LLMError on failure of the evaluator
+ * call specifically; the caller must surface this explicitly and never
+ * treat it as "no issues found". A verifier-call failure is handled
+ * locally (see below) rather than propagated, since we still have a
+ * usable — just unverified — set of candidates to fall back on. */
 async function runSemanticLayer(
   providers: Providers, request: string, output: string,
   extracted: ExtractedRequirement[], adv: AdditionalChecks,
@@ -46,7 +53,7 @@ async function runSemanticLayer(
   const listItemCount = countListItems(output);
   const evalData = await providers.evaluator.completeJSON<{ issues: CandidateIssue[] }>(
     buildEvaluatorPrompt(request, output, requirementsJson, adv, listItemCount),
-    { temperature: 0.1, maxTokens: 1500 },
+    { temperature: 0.1, maxTokens: 2200, timeoutMs: 26000, stage: 'evaluator' },
   );
   const rawIssues = Array.isArray(evalData?.issues) ? evalData.issues : [];
   if (!rawIssues.length) return { findings: [] };
@@ -57,10 +64,15 @@ async function runSemanticLayer(
   let verdicts: VerifierVerdict[] = [];
   try {
     const v = await verifierProvider.completeJSON<VerifierVerdict[]>(
-      buildVerifierPrompt(rawIssues, request, output), { temperature: 0.1, maxTokens: 1000 },
+      buildVerifierPrompt(rawIssues, request, output), { temperature: 0.1, maxTokens: 1400, timeoutMs: 13000, stage: 'verifier' },
     );
     verdicts = Array.isArray(v) ? v : [];
   } catch (e) {
+    // Verifier call itself failed (evaluator succeeded). Keep candidates
+    // but mark every one explicitly unverified rather than silently
+    // dropping the whole semantic layer — this is an intentional,
+    // documented fallback, distinct from a genuine evaluator failure.
+    console.error(`[sanitygate:verifier] verifier call failed, falling back to "unverified" for ${rawIssues.length} candidate(s): ${e instanceof LLMError ? e.code : (e as Error).message}`);
     verdicts = rawIssues.map(() => ({ verdict: 'uncertain', confidence: 0.5, reason: 'Could not verify automatically.', suggestionOk: false }));
   }
 
@@ -115,13 +127,31 @@ export async function runPipeline(
     if (!providers.extraction || !providers.evaluator) {
       semanticError = 'unavailable';
     } else {
+      // Extraction failure is NOT fatal to the whole semantic review: the
+      // evaluator prompt always includes the raw request text regardless
+      // of whether extraction produced a clean structured list, so a
+      // failed extraction degrades to "the evaluator works from the raw
+      // text with an empty requirements list" rather than killing
+      // instruction-following/source-grounding checking entirely. This
+      // directly addresses a real failure mode: on a long, multi-
+      // objective document, extraction is the stage most likely to run
+      // out of its token budget, and previously any failure there
+      // aborted everything downstream.
       try {
         extracted = await runExtraction(providers.extraction, request);
-        if (adv.cta) extracted = [...extracted, { type: 'required_content', text: 'The output must include a clear call to action.' }];
+      } catch (e) {
+        console.error(`[sanitygate:extraction] extraction failed, proceeding with an empty requirement list: ${e instanceof LLMError ? e.code : (e as Error).message}`);
+        extracted = [];
+      }
+      if (adv.cta) extracted = [...extracted, { type: 'required_content', text: 'The output must include a clear call to action.' }];
+
+      try {
         const sem = await runSemanticLayer(providers, request, output, extracted, adv);
         semanticFindings = sem.findings;
       } catch (e) {
-        semanticError = e instanceof LLMError ? e.code : 'upstream_error';
+        const code = e instanceof LLMError ? e.code : 'upstream_error';
+        console.error(`[sanitygate:evaluator] semantic review failed: ${code}${e instanceof Error ? ' — ' + e.message : ''}`);
+        semanticError = code;
       }
     }
   }

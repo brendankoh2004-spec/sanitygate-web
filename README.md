@@ -91,27 +91,53 @@ Visit http://localhost:3000. The check screen works fully deterministic-only
 even with no LLM key configured (it just tells you semantic checks are
 unavailable, never fakes a clean result — see `lib/pipeline.ts`).
 
-## 6. Run the golden-dataset evaluation
+## 6. Run the tests
 
-Once your `.env.local` has a real `OPENROUTER_API_KEY`:
+Two separate test layers, deliberately kept separate:
 
 ```bash
-npm run eval
+npm run test:unit   # no network/API key needed — runs in seconds
+npm run eval        # requires a real OPENROUTER_API_KEY — makes live LLM calls
 ```
 
-This runs all 32 cases in `evaluation/golden_cases.json` against your live
-provider and prints precision, recall, false-positive rate, evidence
-accuracy, and suggestion-grounding accuracy. It writes a timestamped result
-to `evaluation/results/`. To lock in a baseline for future regression
-detection:
+**`npm run test:unit`** (`test/`) — pure logic tests against the deterministic
+numeric validator, the pipeline's failure-handling behavior (mocked
+providers, no network), and JSON-salvage parsing. These need no API key
+and are safe to run in CI on every commit; they're what caught several
+real bugs (a broken relative import, a boolean-coercion bug, string-vs-
+numeric comparison bugs in the old numeric validator) before this README
+was even written. Run this first — if it fails, `npm run eval` isn't
+worth running yet.
+
+**`npm run eval`** (`evaluation/`) — runs all 60 cases in
+`evaluation/golden_cases.json` against your live provider and prints
+precision, recall, false-positive rate, evidence accuracy, suggestion-
+grounding accuracy, and requirement-extraction accuracy. It writes a
+timestamped result to `evaluation/results/`. To lock in a baseline for
+future regression detection:
 
 ```bash
 cp evaluation/results/run-<timestamp>.json evaluation/results/baseline.json
 ```
 
-Re-run `npm run eval` any time you change `lib/prompts.ts` or a validator —
-it will tell you if recall dropped or the false-positive rate rose
-compared to the baseline, and exit with code 1 (wire this into CI).
+Re-run `npm run eval` any time you change a prompt in `lib/prompts.ts` or
+a validator — it will tell you if recall dropped or the false-positive
+rate rose compared to the baseline, and exit with code 1 (wire this into
+CI). Re-run `npm run test:unit` on every commit; `npm run eval` whenever
+you touch a prompt or validator and have API budget to spend on it.
+
+### Diagnosing a semantic-review failure in production
+
+If the app ever shows "SanityGate couldn't complete the semantic
+review," check the Vercel function logs for a line starting
+`[sanitygate:<stage>]` — `stage` is one of `extraction`, `evaluator`, or
+`verifier`, telling you exactly which of the three LLM calls failed and
+why (timeout, rate limit, upstream HTTP error, or a JSON parse failure —
+including whether a *partial* result was salvaged from a truncated
+response before giving up entirely). These logs never include prompt
+text, source/output content, or API keys — only the failing stage,
+model name, HTTP status/error code, and response-length/truncation
+diagnostics.
 
 ## 7. Deploy to Vercel
 
@@ -173,10 +199,26 @@ pilot users. No login, no Claude account, no API key of their own required.
   never as a fake "no issues found" (`lib/pipeline.ts` sets
   `semanticError`, and the UI renders it explicitly).
 - Small/free models are less reliable at strict JSON output and nuanced
-  judgment than a frontier model. `lib/llm/openrouter.ts` has best-effort
-  JSON extraction (handles markdown fences and prose wrapping), but a
-  sufficiently non-compliant model can still throw `invalid_response`,
-  which is surfaced the same honest way.
+  judgment than a frontier model. `lib/llm/openrouter.ts` now salvages a
+  partial result when a response is truncated mid-array (the most common
+  failure on long documents with small free models, since it means
+  `max_tokens` ran out before the model finished listing every finding),
+  but a sufficiently non-compliant or slow model can still throw
+  `invalid_response` or `timeout`, which is surfaced the same honest way.
+- **Vercel function time budget**: `app/api/check/route.ts` sets
+  `maxDuration = 60` (the ceiling on Vercel's free/hobby tier). The
+  pipeline makes up to three sequential LLM calls (extraction, evaluator,
+  verifier); their per-call timeouts are deliberately set to sum to well
+  under 60s (10s + 26s + 13s = 49s, leaving headroom for the Supabase
+  write and response serialization). This is a real constraint, not just
+  a tuning choice: a slow free model on a genuinely long document can
+  still hit these per-call timeouts before finishing, which surfaces as
+  an honest `timeout` semantic-review failure rather than a truncated
+  JSON parse failure — but it means very long documents on a slow model
+  may fail more often than they would with a longer budget. If this
+  becomes a real pilot issue, the fix is a Vercel Pro plan (`maxDuration`
+  up to 300s) with correspondingly longer per-call timeouts in
+  `lib/pipeline.ts`, not a code change.
 - No account system by design for the pilot (see spec). History is
   per-browser, not per-person — clearing localStorage loses the link to
   past checks (the checks themselves stay in the database).

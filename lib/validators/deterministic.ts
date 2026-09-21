@@ -51,26 +51,163 @@ function findOccurrences(text: string, term: string) {
   return out;
 }
 
-interface NumMatch { type: 'money' | 'percent'; raw: string; norm: string; start: number; end: number; }
+interface NumMatch { kind: 'money' | 'percent'; raw: string; value: number; start: number; end: number; }
 
-function extractMoneyAndPercent(text: string): NumMatch[] {
+// Recognizes an optional short currency-code prefix (S$, US$, A$, ...),
+// the numeric amount (with optional comma grouping / decimals), and an
+// optional scale word — "$0.96 million" and "$960,000" both need to
+// resolve to the same numeric value, which requires actually parsing the
+// scale word rather than comparing the matched substrings as text.
+const MONEY_RE = /[A-Za-z]{0,3}\$\s?(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)\s?(million|billion|thousand|mn|bn)?\b/gi;
+const PERCENT_RE = /(\d{1,3}(?:\.\d+)?)\s?%/g;
+
+function moneyValue(numStr: string, scale?: string): number {
+  let n = parseFloat(numStr.replace(/,/g, ''));
+  if (scale) {
+    const s = scale.toLowerCase();
+    if (s.startsWith('million') || s === 'mn') n *= 1_000_000;
+    else if (s.startsWith('billion') || s === 'bn') n *= 1_000_000_000;
+    else if (s.startsWith('thousand')) n *= 1_000;
+  }
+  return n;
+}
+
+function extractNumbers(text: string): NumMatch[] {
   const out: NumMatch[] = [];
-  const moneyRe = /\$\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?(?:\s?\/\s?(?:user\/mo(?:nth)?|mo|month|yr|year|wk|week))?/gi;
-  const pctRe = /\d{1,3}(?:\.\d+)?\s?%/g;
   let m: RegExpExecArray | null;
-  while ((m = moneyRe.exec(text))) out.push({ type: 'money', raw: m[0], norm: normMoney(m[0]), start: m.index, end: m.index + m[0].length });
-  while ((m = pctRe.exec(text))) out.push({ type: 'percent', raw: m[0], norm: normPct(m[0]), start: m.index, end: m.index + m[0].length });
+  const moneyRe = new RegExp(MONEY_RE.source, MONEY_RE.flags);
+  while ((m = moneyRe.exec(text))) {
+    out.push({ kind: 'money', raw: m[0].trim(), value: moneyValue(m[1], m[2]), start: m.index, end: m.index + m[0].length });
+  }
+  const pctRe = new RegExp(PERCENT_RE.source, PERCENT_RE.flags);
+  while ((m = pctRe.exec(text))) {
+    out.push({ kind: 'percent', raw: m[0].trim(), value: parseFloat(m[1]), start: m.index, end: m.index + m[0].length });
+  }
   return out.sort((a, b) => a.start - b.start);
 }
-function normMoney(s: string): string {
-  const n = (s.match(/[\d,.]+/) || [''])[0].replace(/,/g, '');
-  let per = '';
-  if (/\/\s?user\/mo/i.test(s)) per = '/user/mo';
-  else if (/\/\s?(mo|month)/i.test(s)) per = '/mo';
-  else if (/\/\s?(yr|year)/i.test(s)) per = '/yr';
-  return n + per;
+
+// Sentence boundary search that skips periods used as decimal points (a
+// period with a digit on both sides, e.g. the "." in "$8.42") rather than
+// treating every "." as a sentence end — a naive indexOf('.', ...) would
+// truncate evidence for any sentence containing a decimal number.
+function sentenceBounds(text: string, idx: number): { start: number; end: number } {
+  let start = 0;
+  for (let i = idx - 1; i >= 0; i--) {
+    const ch = text[i];
+    if (ch === '\n') { start = i + 1; break; }
+    if (ch === '.' && !(i > 0 && /\d/.test(text[i - 1]) && i + 1 < text.length && /\d/.test(text[i + 1]))) { start = i + 1; break; }
+  }
+  let end = text.length;
+  for (let i = idx; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '\n') { end = i; break; }
+    if (ch === '.' && !(i > 0 && /\d/.test(text[i - 1]) && i + 1 < text.length && /\d/.test(text[i + 1]))) { end = i + 1; break; }
+  }
+  return { start, end };
 }
-function normPct(s: string): string { return (s.match(/[\d.]+/) || [''])[0] + '%'; }
+
+// Deliberately small — just enough to keep generic connector/filler words,
+// and generic reporting-cadence words like "quarter"/"year" (which appear
+// in almost every business sentence and are too weak on their own to
+// confidently pair two figures), from drowning out the content words
+// ("revenue", "online", "discount", a plan name, ...) that actually
+// distinguish one figure from another.
+const STOPWORDS = new Set(['the', 'a', 'an', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'or', 'is', 'was',
+  'were', 'be', 'been', 'being', 'has', 'have', 'had', 'with', 'by', 'from', 'that', 'this', 'it', 'its',
+  'as', 'will', 'would', 'plan', 'plans', 'during', 'about', 'over', 'under', 'more', 'less', 'than',
+  'compared', 'approximately', 'around', 'which', 'who', 'into', 'also', 'not', 'no', 'still', 'per',
+  'quarter', 'quarterly', 'year', 'yearly', 'month', 'monthly', 'period', 'reported', 'report',
+  'company', 'division', 'figure', 'figures', 'amount', 'amounted', 'reaching',
+  'million', 'billion', 'thousand', 'mn', 'bn']);
+
+// Context is scoped to the ENCLOSING SENTENCE only, not a fixed character
+// window — a fixed-width window lets words from an adjacent sentence leak
+// in purely by physical proximity, which can cause a false tie (or worse,
+// a confident wrong match) between figures that aren't actually related.
+function contextWords(text: string, numStart: number, numEnd: number): Set<string> {
+  const { start } = sentenceBounds(text, numStart);
+  const { end } = sentenceBounds(text, numEnd);
+  const sentence = text.slice(start, end).toLowerCase();
+  const words = sentence.split(/[^a-z]+/).filter(w => w.length >= 3 && !STOPWORDS.has(w));
+  return new Set(words);
+}
+
+function overlapScore(a: Set<string>, b: Set<string>): number {
+  let n = 0;
+  for (const w of a) if (b.has(w)) n++;
+  return n;
+}
+
+// Tolerance accounts for float rounding after scale-word multiplication,
+// not for genuine differences — $8.42M vs $9.42M is well outside this.
+function valuesEqual(a: number, b: number): boolean {
+  const tol = Math.max(0.005, Math.max(Math.abs(a), Math.abs(b)) * 0.0005);
+  return Math.abs(a - b) <= tol;
+}
+
+/** The sentence containing `idx`, for focused evidence — never a dump of
+ * every number in the document. */
+function sentenceAround(text: string, idx: number): string {
+  const { start, end } = sentenceBounds(text, idx);
+  const sentence = text.slice(start, end).trim();
+  if (sentence.length > 5 && sentence.length < 320) return sentence;
+  return text.slice(Math.max(0, idx - 80), Math.min(text.length, idx + 80)).trim();
+}
+
+/**
+ * Contextual numeric comparison. Replaces a prior "collect every money/
+ * percent figure into a global set and flag anything not in the set"
+ * approach, which produced both false positives (equivalent values in
+ * different formats: "$0.96 million" vs "$960,000", "42%" vs "42.0%",
+ * "$66.6" vs "$66.60" — same value, different text) and false negatives
+ * (a figure that exists somewhere in the source, attached to the wrong
+ * fact, would silently pass because the number itself was "in the set").
+ *
+ * For each figure in the output, this finds the source figure of the
+ * same kind (money/percent) whose surrounding words overlap the output
+ * figure's surrounding words the most, and compares ONLY against that
+ * best match. It only flags when there is exactly one clearly-best,
+ * non-ambiguous contextual match AND the normalized values genuinely
+ * differ. If no confident match exists, it does not flag anything —
+ * staying conservative and deferring to semantic evaluation rather than
+ * manufacturing a finding, per the "deterministic checks must remain
+ * conservative" requirement.
+ */
+function contextualNumericCheck(request: string, output: string): { findings: Finding[]; anyCompared: boolean } {
+  const reqNums = extractNumbers(request);
+  const outNums = extractNumbers(output);
+  const findings: Finding[] = [];
+  let anyCompared = false;
+
+  for (const on of outNums) {
+    const candidates = reqNums.filter(rn => rn.kind === on.kind);
+    if (!candidates.length) continue;
+    const onCtx = contextWords(output, on.start, on.end);
+    let best: NumMatch | null = null;
+    let bestScore = 0;
+    let ambiguous = false;
+    for (const c of candidates) {
+      const score = overlapScore(onCtx, contextWords(request, c.start, c.end));
+      if (score > bestScore) { best = c; bestScore = score; ambiguous = false; }
+      else if (score === bestScore && score > 0) ambiguous = true;
+    }
+    if (!best || bestScore < 1 || ambiguous) continue;
+
+    anyCompared = true;
+    if (!valuesEqual(on.value, best.value)) {
+      findings.push(mkFinding({
+        type: 'numerical_mismatch', severity: 'critical', confidence: 0.92,
+        start: on.start, end: on.end, matchedText: on.raw,
+        reason: on.kind === 'money'
+          ? 'This figure differs from the matching amount in your request.'
+          : 'This percentage differs from the matching figure in your request.',
+        evidence: sentenceAround(request, best.start),
+        suggestion: `Change "${on.raw}" to match your request ("${best.raw}").`,
+      }));
+    }
+  }
+  return { findings, anyCompared };
+}
 
 export interface DeterministicResult { findings: Finding[]; passed: string[]; wordCount: number; }
 
@@ -156,49 +293,9 @@ export function runDeterministic(request: string, output: string, adv: Additiona
   }
 
   if (request && request.trim()) {
-    const sNums = extractMoneyAndPercent(request);
-    const oNums = extractMoneyAndPercent(output);
-    // Map norm -> the first verbatim raw string seen for it, so evidence
-    // and suggestions shown to the user quote real source text (e.g.
-    // "$24/user/month") rather than the internal normalized comparison
-    // key (e.g. "24/user/mo"), which is easy to lose the "$" from.
-    const sMoneyRaw = new Map<string, string>();
-    sNums.filter(n => n.type === 'money').forEach(n => { if (!sMoneyRaw.has(n.norm)) sMoneyRaw.set(n.norm, n.raw.trim()); });
-    const sPctRaw = new Map<string, string>();
-    sNums.filter(n => n.type === 'percent').forEach(n => { if (!sPctRaw.has(n.norm)) sPctRaw.set(n.norm, n.raw.trim()); });
-
-    let flagged = false;
-    if (sMoneyRaw.size) {
-      const rawList = [...sMoneyRaw.values()];
-      for (const n of oNums.filter(n => n.type === 'money')) {
-        if (!sMoneyRaw.has(n.norm)) {
-          flagged = true;
-          findings.push(mkFinding({
-            type: 'numerical_mismatch', severity: 'critical', confidence: 0.96,
-            start: n.start, end: n.end, matchedText: n.raw,
-            reason: 'Your request lists different pricing than what appears in the output.',
-            evidence: `Amount(s) in your request: ${rawList.join(', ')}`,
-            suggestion: `Change "${n.raw}" to match your request (${rawList.join(' or ')}).`,
-          }));
-        }
-      }
-    }
-    if (sPctRaw.size) {
-      const rawList = [...sPctRaw.values()];
-      for (const n of oNums.filter(n => n.type === 'percent')) {
-        if (!sPctRaw.has(n.norm)) {
-          flagged = true;
-          findings.push(mkFinding({
-            type: 'numerical_mismatch', severity: 'critical', confidence: 0.9,
-            start: n.start, end: n.end, matchedText: n.raw,
-            reason: 'Your request lists a different percentage than what appears in the output.',
-            evidence: `Percentage(s) in your request: ${rawList.join(', ')}`,
-            suggestion: `Change "${n.raw}" to match your request (${rawList.join(' or ')}).`,
-          }));
-        }
-      }
-    }
-    if (!flagged && (sMoneyRaw.size || sPctRaw.size)) passed.push('Numbers match what you provided, where directly comparable');
+    const { findings: numFindings, anyCompared } = contextualNumericCheck(request, output);
+    findings.push(...numFindings);
+    if (anyCompared && numFindings.length === 0) passed.push('Numbers checked against your request are consistent');
   }
 
   return { findings, passed, wordCount: wc };

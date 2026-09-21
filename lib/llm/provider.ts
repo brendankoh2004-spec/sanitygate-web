@@ -22,6 +22,11 @@ export interface LLMJsonOptions {
   maxTokens?: number;
   /** Abort the call after this many ms. */
   timeoutMs?: number;
+  /** Purely a label for server-side diagnostics (e.g. 'extraction',
+   * 'evaluator', 'verifier') — never sent to the provider, never
+   * included in any user-facing output. Lets failure logs say which
+   * pipeline stage broke without needing to log prompt/response content. */
+  stage?: string;
 }
 
 /**

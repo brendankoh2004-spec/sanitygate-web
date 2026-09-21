@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
+    "test:unit": "tsx test/run_all.ts",
     "eval": "tsx evaluation/run_eval.ts"
   },
   "dependencies": {

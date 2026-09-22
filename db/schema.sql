@@ -41,7 +41,8 @@ create table if not exists checks (
   word_count int not null default 0,
   duration_ms int not null default 0,
   semantic_error text,
-  has_reference boolean not null default false
+  has_reference boolean not null default false,
+  check_status text not null default 'clean'  -- 'clean'|'findings'|'needs_review'|'check_incomplete' — see lib/types.ts CheckStatus. A failed/incomplete semantic check must never be indistinguishable from a genuinely clean one.
 );
 create index if not exists checks_session_idx on checks (session_id, created_at desc);
 create index if not exists checks_created_idx on checks (created_at desc);

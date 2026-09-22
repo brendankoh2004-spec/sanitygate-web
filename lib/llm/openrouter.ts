@@ -52,6 +52,18 @@ export class OpenRouterProvider implements LLMProvider {
           model: this.model,
           temperature: opts.temperature ?? 0.1,
           max_tokens: opts.maxTokens ?? 1200,
+          // Best-effort mitigation for reasoning-capable models: some free
+          // OpenRouter models spend hidden "thinking" tokens against the
+          // same max_tokens budget before ever emitting visible content,
+          // which can exhaust the budget and return finish_reason="length"
+          // with an EMPTY message.content — a strong signature we've seen
+          // in production. OpenRouter's reasoning-control API lets a
+          // request opt out of this for models that support it; models/
+          // providers that don't recognize the field simply ignore it, so
+          // this is safe to send unconditionally. Not verified against a
+          // live call in this environment — treat as best-effort, not
+          // confirmed, until tested with a real API key.
+          reasoning: { exclude: true },
           messages: [
             {
               role: 'user',

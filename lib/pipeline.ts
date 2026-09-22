@@ -1,6 +1,6 @@
 import { Finding, PipelineResult, AdditionalChecks, FindingType, ExtractedRequirement, ExtractionResult } from './types';
 import { runDeterministic, dedupe, mkFinding, countListItems } from './validators/deterministic';
-import { buildExtractionPrompt, buildEvaluatorPrompt, buildVerifierPrompt, CandidateIssue, VerifierVerdict } from './prompts';
+import { buildExtractionPrompt, buildEvaluatorPrompt, buildVerifierPrompt, CandidateIssue, VerifierResult } from './prompts';
 import { validateEvidence } from './evidence';
 import { LLMProvider, LLMError } from './llm/provider';
 
@@ -25,7 +25,7 @@ export interface Providers {
 async function runExtraction(provider: LLMProvider, request: string): Promise<ExtractedRequirement[]> {
   if (!request || !request.trim()) return [];
   const data = await provider.completeJSON<ExtractionResult>(buildExtractionPrompt(request), {
-    temperature: 0.05, maxTokens: 1400, timeoutMs: 10000, stage: 'extraction',
+    temperature: 0.05, maxTokens: 1200, timeoutMs: 8000, stage: 'extraction',
   });
   const reqs = Array.isArray(data?.requirements) ? data.requirements : [];
   const validTypes = new Set(['length', 'required_content', 'quantity', 'format', 'prohibition', 'order', 'fact']);
@@ -35,12 +35,47 @@ async function runExtraction(provider: LLMProvider, request: string): Promise<Ex
   }));
 }
 
-/** Steps 2-4: evaluator -> programmatic evidence validation -> verifier
- * (+ suggestion self-check). Throws LLMError on failure of the evaluator
- * call specifically; the caller must surface this explicitly and never
- * treat it as "no issues found". A verifier-call failure is handled
- * locally (see below) rather than propagated, since we still have a
- * usable — just unverified — set of candidates to fall back on. */
+/** Turns one raw LLM-reported issue (from either the evaluator or the
+ * verifier's own independent scan) into a Finding, running it through
+ * the same programmatic evidence validation either way — evidence
+ * fabrication is a risk regardless of which call produced the claim.
+ * `sourceLabel` only affects internal bookkeeping (needsReview default),
+ * never anything shown to a different model or trusted blindly. */
+function buildFinding(issue: CandidateIssue, request: string, output: string, confidence: number, needsReview: boolean, suggestionVerified: boolean): Finding | null {
+  const evCheck = validateEvidence(output, request, issue.generated_text, issue.source_evidence);
+  if (evCheck.suppress) return null; // claimed passage doesn't exist in the output at all
+  const finalConfidence = evCheck.forceNeedsReview ? Math.min(confidence, 0.65) : confidence;
+  return mkFinding({
+    type: FINDING_TYPES.includes(issue.type as FindingType) ? (issue.type as FindingType) : 'requirement_violation',
+    severity: issue.severity === 'critical' ? 'critical' : 'warning',
+    confidence: finalConfidence,
+    source: 'semantic',
+    start: evCheck.generatedTextSpan.start, end: evCheck.generatedTextSpan.end,
+    matchedText: issue.generated_text || null,
+    reason: issue.explanation || 'Potential issue detected.',
+    evidence: evCheck.evidenceSpan.found ? (issue.source_evidence || null) : null,
+    requirement: issue.requirement || null,
+    suggestion: suggestionVerified ? (issue.suggested_change || null) : null,
+    suggestionVerified,
+    needsReview: needsReview || evCheck.forceNeedsReview,
+    evidenceValidated: evCheck.generatedTextSpan.exact && evCheck.evidenceSpan.found,
+  });
+}
+
+/** Steps 2-4: evaluator -> verifier, where the verifier has TWO jobs —
+ * (a) skeptically confirm/reject each evaluator candidate, and (b)
+ * independently re-inspect the original request/output itself for
+ * anything the evaluator missed. (b) is what makes the verifier a real
+ * second line of defence rather than a JSON-cleanup pass: it runs even
+ * when the evaluator found zero candidates, which is exactly the
+ * situation where a single-pass evaluator miss would otherwise become a
+ * false "clean" result with nothing to catch it.
+ *
+ * Throws LLMError only on evaluator failure — the caller must surface
+ * that explicitly and never treat it as "no issues found". A verifier
+ * failure is handled locally: the evaluator's own candidates are still
+ * usable (just unverified), even though the independent-miss-catching
+ * pass didn't get to run that time. */
 async function runSemanticLayer(
   providers: Providers, request: string, output: string,
   extracted: ExtractedRequirement[], adv: AdditionalChecks,
@@ -53,60 +88,62 @@ async function runSemanticLayer(
   const listItemCount = countListItems(output);
   const evalData = await providers.evaluator.completeJSON<{ issues: CandidateIssue[] }>(
     buildEvaluatorPrompt(request, output, requirementsJson, adv, listItemCount),
-    { temperature: 0.1, maxTokens: 2200, timeoutMs: 26000, stage: 'evaluator' },
+    { temperature: 0.1, maxTokens: 2000, timeoutMs: 24000, stage: 'evaluator' },
   );
   const rawIssues = Array.isArray(evalData?.issues) ? evalData.issues : [];
-  if (!rawIssues.length) return { findings: [] };
-
-  const evidenceChecks = rawIssues.map(issue => validateEvidence(output, request, issue.generated_text, issue.source_evidence));
 
   const verifierProvider = providers.verifier || providers.evaluator;
-  let verdicts: VerifierVerdict[] = [];
+  let verified: VerifierResult = { verdicts: [], additional_findings: [] };
+  let verifierRan = false;
   try {
-    const v = await verifierProvider.completeJSON<VerifierVerdict[]>(
-      buildVerifierPrompt(rawIssues, request, output), { temperature: 0.1, maxTokens: 1400, timeoutMs: 13000, stage: 'verifier' },
+    const v = await verifierProvider.completeJSON<VerifierResult>(
+      buildVerifierPrompt(rawIssues, request, output, requirementsJson),
+      { temperature: 0.1, maxTokens: 2000, timeoutMs: 22000, stage: 'verifier' },
     );
-    verdicts = Array.isArray(v) ? v : [];
+    verified = {
+      verdicts: Array.isArray(v?.verdicts) ? v.verdicts : [],
+      additional_findings: Array.isArray(v?.additional_findings) ? v.additional_findings.slice(0, 5) : [],
+    };
+    verifierRan = true;
   } catch (e) {
-    // Verifier call itself failed (evaluator succeeded). Keep candidates
-    // but mark every one explicitly unverified rather than silently
-    // dropping the whole semantic layer — this is an intentional,
-    // documented fallback, distinct from a genuine evaluator failure.
-    console.error(`[sanitygate:verifier] verifier call failed, falling back to "unverified" for ${rawIssues.length} candidate(s): ${e instanceof LLMError ? e.code : (e as Error).message}`);
-    verdicts = rawIssues.map(() => ({ verdict: 'uncertain', confidence: 0.5, reason: 'Could not verify automatically.', suggestionOk: false }));
+    // Verifier call failed entirely (evaluator succeeded). The evaluator's
+    // own candidates are kept but marked explicitly unverified rather than
+    // dropped — this is an intentional, documented fallback, distinct
+    // from a genuine evaluator failure. Its "catch misses" role simply
+    // did not run this time; nothing pretends otherwise.
+    console.error(`[sanitygate:verifier] verifier call failed, evaluator candidates kept as unverified, independent re-check did not run: ${e instanceof LLMError ? e.code : (e as Error).message}`);
   }
 
   const findings: Finding[] = [];
-  rawIssues.forEach((issue, i) => {
-    const v = verdicts[i] || { verdict: 'rejected', confidence: 0, reason: 'No verification result.', suggestionOk: false };
-    const evCheck = evidenceChecks[i];
 
-    if (evCheck.suppress) return;
+  rawIssues.forEach((issue, i) => {
+    const v = verified.verdicts[i] || (verifierRan
+      ? { verdict: 'rejected', confidence: 0, reason: 'No verification result.', suggestionOk: false }
+      : { verdict: 'uncertain', confidence: 0.5, reason: 'Could not verify automatically.', suggestionOk: false });
     if (v.verdict === 'rejected' && (typeof v.confidence !== 'number' || v.confidence < 0.4)) return;
 
     const modelConfidence = typeof v.confidence === 'number' ? v.confidence : (issue.confidence ?? 0.5);
-    const finalConfidence = evCheck.forceNeedsReview ? Math.min(modelConfidence, 0.65) : modelConfidence;
-    const needsReview = finalConfidence < 0.75 || v.verdict !== 'confirmed' || evCheck.forceNeedsReview;
-
+    const needsReview = modelConfidence < 0.75 || v.verdict !== 'confirmed';
     const suggestionHasContent = !!(issue.suggested_change && issue.suggested_change.trim());
     const suggestionVerified = suggestionHasContent ? !!v.suggestionOk : true;
 
-    findings.push(mkFinding({
-      type: FINDING_TYPES.includes(issue.type as FindingType) ? (issue.type as FindingType) : 'requirement_violation',
-      severity: issue.severity === 'critical' ? 'critical' : 'warning',
-      confidence: finalConfidence,
-      source: 'semantic',
-      start: evCheck.generatedTextSpan.start, end: evCheck.generatedTextSpan.end,
-      matchedText: issue.generated_text || null,
-      reason: issue.explanation || 'Potential issue detected.',
-      evidence: evCheck.evidenceSpan.found ? (issue.source_evidence || null) : null,
-      requirement: issue.requirement || null,
-      suggestion: suggestionVerified ? (issue.suggested_change || null) : null,
-      suggestionVerified,
-      needsReview,
-      evidenceValidated: evCheck.generatedTextSpan.exact && evCheck.evidenceSpan.found,
-    }));
+    const f = buildFinding(issue, request, output, modelConfidence, needsReview, suggestionVerified);
+    if (f) findings.push(f);
   });
+
+  // The verifier's own independently-discovered findings are, by
+  // definition, single-sourced (only one model pass has seen them — the
+  // verifier didn't get a second opinion on its own discoveries the way
+  // evaluator candidates do). They still go through the same
+  // programmatic evidence check, but are always surfaced as "needs
+  // review" rather than high-confidence, regardless of the stated
+  // confidence — an honest reflection of "the checker's own judgment
+  // flagged something", not a fully cross-verified finding.
+  verified.additional_findings.forEach(issue => {
+    const f = buildFinding(issue, request, output, Math.min(issue.confidence ?? 0.6, 0.7), true, false);
+    if (f) findings.push(f);
+  });
+
   return { findings };
 }
 
@@ -132,11 +169,7 @@ export async function runPipeline(
       // of whether extraction produced a clean structured list, so a
       // failed extraction degrades to "the evaluator works from the raw
       // text with an empty requirements list" rather than killing
-      // instruction-following/source-grounding checking entirely. This
-      // directly addresses a real failure mode: on a long, multi-
-      // objective document, extraction is the stage most likely to run
-      // out of its token budget, and previously any failure there
-      // aborted everything downstream.
+      // instruction-following/source-grounding checking entirely.
       try {
         extracted = await runExtraction(providers.extraction, request);
       } catch (e) {
@@ -157,6 +190,21 @@ export async function runPipeline(
   }
 
   const all = dedupe([...det.findings, ...semanticFindings]);
+
+  // Part 6 status model: CHECK_INCOMPLETE always wins — a failed check is
+  // never presented as clean, no matter how many (or few) deterministic
+  // findings happened to come back. Otherwise CLEAN only if genuinely
+  // nothing was found at all; FINDINGS if anything high-confidence
+  // exists; NEEDS_REVIEW if everything found is lower-confidence.
+  const activeFindings = all;
+  const checkStatus: PipelineResult['checkStatus'] = semanticError
+    ? 'check_incomplete'
+    : activeFindings.length === 0
+      ? 'clean'
+      : activeFindings.some(f => !f.needsReview)
+        ? 'findings'
+        : 'needs_review';
+
   return {
     findings: all,
     passedChecks: det.passed,
@@ -165,5 +213,6 @@ export async function runPipeline(
     semanticError,
     hasReference: hasRequest,
     extractedRequirements: extracted,
+    checkStatus,
   };
 }

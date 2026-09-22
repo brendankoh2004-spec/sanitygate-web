@@ -45,8 +45,10 @@ npm install
    - **Already have a SanityGate database from an earlier version of this
      project?** `db/schema.sql` uses `create table if not exists`, which
      does nothing to a table that already exists — it will NOT add or
-     rename columns for you. Run `db/migrations/0001_sync_two_box_schema.sql`
-     first (safe to run once, safe to re-run), then re-run `db/schema.sql`.
+     rename columns for you. Run every file in `db/migrations/` in order
+     (`0001_sync_two_box_schema.sql`, then `0002_add_check_status.sql` —
+     both idempotent, safe to run once or re-run), then re-run
+     `db/schema.sql`.
 3. Under Project Settings → API, copy:
    - **Project URL** → `NEXT_PUBLIC_SUPABASE_URL`
    - **service_role key** (not the anon key) → `SUPABASE_SERVICE_ROLE_KEY`
@@ -207,18 +209,36 @@ pilot users. No login, no Claude account, no API key of their own required.
   `invalid_response` or `timeout`, which is surfaced the same honest way.
 - **Vercel function time budget**: `app/api/check/route.ts` sets
   `maxDuration = 60` (the ceiling on Vercel's free/hobby tier). The
-  pipeline makes up to three sequential LLM calls (extraction, evaluator,
-  verifier); their per-call timeouts are deliberately set to sum to well
-  under 60s (10s + 26s + 13s = 49s, leaving headroom for the Supabase
-  write and response serialization). This is a real constraint, not just
-  a tuning choice: a slow free model on a genuinely long document can
-  still hit these per-call timeouts before finishing, which surfaces as
-  an honest `timeout` semantic-review failure rather than a truncated
-  JSON parse failure — but it means very long documents on a slow model
-  may fail more often than they would with a longer budget. If this
-  becomes a real pilot issue, the fix is a Vercel Pro plan (`maxDuration`
-  up to 300s) with correspondingly longer per-call timeouts in
-  `lib/pipeline.ts`, not a code change.
+  pipeline makes three sequential LLM calls (extraction, evaluator,
+  verifier — the verifier now also independently re-inspects the source
+  material, not just rubber-stamping candidates, so it needs a real token
+  budget too); their per-call timeouts are deliberately set to sum to
+  well under 60s (8s + 24s + 22s = 54s, leaving ~6s headroom for the
+  Supabase write and response serialization). This is a real constraint,
+  not just a tuning choice: a slow free model on a genuinely long
+  document can still hit these per-call timeouts before finishing, which
+  surfaces as an honest `timeout` semantic-review failure rather than a
+  truncated JSON parse failure — but it means very long documents on a
+  slow model may fail more often than they would with a longer budget. If
+  this becomes a real pilot issue, the fix is a Vercel Pro plan
+  (`maxDuration` up to 300s) with correspondingly longer per-call
+  timeouts in `lib/pipeline.ts`, not a code change.
+- **Verify `OPENROUTER_MODEL` is a real, specific model slug.** A
+  production run once logged `model=openrouter/free` and produced an
+  empty response body with `finish_reason=length` on the extraction call
+  — `openrouter/free` is not a real OpenRouter model ID (real free-tier
+  slugs look like `meta-llama/llama-3.1-8b-instruct:free`); if this value
+  ends up in your Vercel environment variables, whatever OpenRouter routes
+  it to is undefined behavior, not a specific, testable model. An empty
+  completion at `finish_reason=length` is also the classic signature of a
+  reasoning-capable model spending its entire token budget on hidden
+  "thinking" before ever emitting the JSON answer — `lib/llm/openrouter.ts`
+  now sends `reasoning: {exclude: true}` on every call as a best-effort
+  mitigation (harmless no-op for models that don't support it, **not
+  verified against a live call** in this environment), but picking a
+  plain instruct model (not a reasoning model) for `OPENROUTER_MODEL` is
+  the more reliable fix. Check https://openrouter.ai/models?max_price=0
+  for the current list before deploying.
 - No account system by design for the pilot (see spec). History is
   per-browser, not per-person — clearing localStorage loses the link to
   past checks (the checks themselves stay in the database).

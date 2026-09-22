@@ -96,6 +96,15 @@ export const DEFAULT_ADDITIONAL: AdditionalChecks = {
   minWords: false, minWordsVal: 50,
 };
 
+// ---------------------------------------------------------------------
+// Part 6 product guarantee: four explicit states, never conflated.
+// CHECK_INCOMPLETE must never be presented as CLEAN — a failed checker
+// is not a clean document. Computed once in lib/pipeline.ts and carried
+// through persistence so it's auditable after the fact, not just an
+// in-memory UI computation.
+// ---------------------------------------------------------------------
+export type CheckStatus = 'clean' | 'findings' | 'needs_review' | 'check_incomplete';
+
 export interface PipelineResult {
   findings: Finding[];
   passedChecks: string[];
@@ -104,6 +113,7 @@ export interface PipelineResult {
   semanticError: string | null;
   hasReference: boolean; // true if the first box contained anything at all
   extractedRequirements: ExtractedRequirement[];
+  checkStatus: CheckStatus;
 }
 
 export interface CheckRecord {
@@ -120,4 +130,5 @@ export interface CheckRecord {
   semanticError: string | null;
   hasReference: boolean;
   extractedRequirements: ExtractedRequirement[];
+  checkStatus: CheckStatus;
 }

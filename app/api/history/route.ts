@@ -20,6 +20,7 @@ interface CheckRow {
   duration_ms: number;
   semantic_error: string | null;
   has_reference: boolean;
+  check_status: string | null;
 }
 
 export async function GET(req: NextRequest) {
@@ -44,6 +45,7 @@ export async function GET(req: NextRequest) {
     extractedRequirements: row.extracted_requirements,
     findings: row.findings, passedChecks: row.passed_checks, wordCount: row.word_count,
     durationMs: row.duration_ms, semanticError: row.semantic_error, hasReference: row.has_reference,
+    checkStatus: row.check_status,
   }));
   return NextResponse.json({ checks, persistenceAvailable: true });
 }

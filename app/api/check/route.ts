@@ -54,6 +54,7 @@ export async function POST(req: NextRequest) {
     semanticError: result.semanticError,
     hasReference: result.hasReference,
     extractedRequirements: result.extractedRequirements,
+    checkStatus: result.checkStatus,
   };
 
   const supabase = getSupabase();
@@ -64,6 +65,7 @@ export async function POST(req: NextRequest) {
       extracted_requirements: rec.extractedRequirements,
       findings: rec.findings, passed_checks: rec.passedChecks, word_count: rec.wordCount,
       duration_ms: rec.durationMs, semantic_error: rec.semanticError, has_reference: rec.hasReference,
+      check_status: rec.checkStatus,
     });
     if (error) console.error('failed to persist check:', error.message);
   }

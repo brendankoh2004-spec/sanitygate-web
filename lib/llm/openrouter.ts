@@ -35,6 +35,14 @@ export class OpenRouterProvider implements LLMProvider {
 
   async completeJSON<T = unknown>(prompt: string, opts: LLMJsonOptions = {}): Promise<T> {
     const stage = opts.stage || 'llm';
+    const callStart = Date.now();
+    // Start-of-call marker with no prompt/document content — this is what
+    // lets production logs answer "did call N even start" independently
+    // of whether it later failed. Previously only failure paths logged
+    // anything, so a successful-but-slow call was invisible until it
+    // either finished (silently) or the whole request's duration was
+    // inspected after the fact.
+    console.error(`[sanitygate:${stage}] calling model=${this.model} timeoutMs=${opts.timeoutMs ?? 30000}`);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), opts.timeoutMs ?? 30000);
 
@@ -116,6 +124,7 @@ export class OpenRouterProvider implements LLMProvider {
     if (parsed.salvaged) {
       console.error(`[sanitygate:${stage}] recovered a partial result from a truncated/malformed response (model=${this.model}, finish_reason=${finishReason ?? 'unknown'})`);
     }
+    console.error(`[sanitygate:${stage}] completed in ${Date.now() - callStart}ms (model=${this.model}, finish_reason=${finishReason ?? 'unknown'}, contentLength=${content.length})`);
     return parsed.value as T;
   }
 }

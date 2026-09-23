@@ -209,6 +209,133 @@ async function testFabricatedEvidenceSuppressed() {
   check('Finding with fabricated generated_text is suppressed regardless of verifier confirmation', result.findings.filter(f => f.source === 'semantic').length === 0, JSON.stringify(result.findings));
 }
 
+// --- THE production-regression scenario: evaluator fails outright
+// (invalid_response, e.g. a bad model draw from openrouter/free's
+// randomized router burning its token budget on hidden reasoning and
+// returning empty content), but the verifier's independent re-scan
+// (Job 2) is a SEPARATE model call that succeeds and catches something
+// anyway. Before this fix, evaluator failure short-circuited the whole
+// runSemanticLayer function and the verifier never even got a chance to
+// run — this is the gap this test targets directly. ---
+class EvaluatorFailsButVerifierIndependentlyCatches implements LLMProvider {
+  name = 'fake'; model = 'x';
+  calls: string[] = [];
+  async completeJSON<T>(prompt: string, opts?: any): Promise<T> {
+    const stage = opts?.stage;
+    this.calls.push(stage);
+    if (stage === 'extraction') return ({ requirements: [] } as unknown) as T;
+    if (stage === 'evaluator') throw new LLMError('invalid_response', 'simulated empty response, finish_reason=length');
+    if (stage === 'verifier') {
+      return ({
+        verdicts: [],
+        additional_findings: [
+          { type: 'contradiction', severity: 'critical', confidence: 0.85, generated_text: 'plans to open additional stores during Q4', source_evidence: 'No store expansion has been formally approved for Q4', requirement: '', explanation: 'Direct contradiction found on independent re-check.', suggested_change: '' },
+        ],
+      } as unknown) as T;
+    }
+    throw new Error('unexpected stage ' + stage);
+  }
+}
+
+async function testVerifierIndependentScanRunsWhenEvaluatorFails() {
+  const provider = new EvaluatorFailsButVerifierIndependentlyCatches();
+  const providers: Providers = { extraction: provider, evaluator: provider, verifier: provider };
+  const result = await runPipeline(providers, REQUEST, OUTPUT, { ...DEFAULT_ADDITIONAL });
+  check('Verifier stage is still attempted after evaluator fails outright (not just on zero issues)', provider.calls.includes('verifier'), provider.calls.join(','));
+  check('semanticError still reflects the evaluator failure (never silently clean)', result.semanticError === 'invalid_response', String(result.semanticError));
+  check('checkStatus is still check_incomplete (evaluator failure never becomes clean, regardless of what the verifier found)', result.checkStatus === 'check_incomplete', result.checkStatus);
+  check('But the verifier\'s independent catch still surfaces as a finding instead of being silently lost', result.findings.some(f => f.type === 'contradiction'), JSON.stringify(result.findings));
+  const found = result.findings.find(f => f.type === 'contradiction');
+  check('Verifier-only finding is marked needsReview', !!found && found.needsReview === true);
+}
+
+// --- One bounded retry, only for invalid_response: first evaluator call
+// hits the bad-model-draw signature, second call (typically routed to a
+// different free model) succeeds normally. ---
+class EvaluatorFailsOnceThenSucceeds implements LLMProvider {
+  name = 'fake'; model = 'x';
+  evaluatorAttempts = 0;
+  async completeJSON<T>(prompt: string, opts?: any): Promise<T> {
+    const stage = opts?.stage;
+    if (stage === 'extraction') return ({ requirements: [] } as unknown) as T;
+    if (stage === 'evaluator') {
+      this.evaluatorAttempts++;
+      if (this.evaluatorAttempts === 1) throw new LLMError('invalid_response', 'simulated empty response on first draw');
+      return ({
+        issues: [
+          { type: 'contradiction', severity: 'critical', confidence: 0.88, generated_text: 'plans to open additional stores during Q4', source_evidence: 'No store expansion has been formally approved for Q4', requirement: '', explanation: 'Direct contradiction with the source.', suggested_change: '' },
+        ],
+      } as unknown) as T;
+    }
+    if (stage === 'verifier') return ({ verdicts: [{ verdict: 'confirmed', confidence: 0.9, reason: 'ok', suggestionOk: false }], additional_findings: [] } as unknown) as T;
+    throw new Error('unexpected stage ' + stage);
+  }
+}
+
+async function testEvaluatorRetryRecoversFromSingleBadDraw() {
+  const provider = new EvaluatorFailsOnceThenSucceeds();
+  const providers: Providers = { extraction: provider, evaluator: provider, verifier: provider };
+  const result = await runPipeline(providers, REQUEST, OUTPUT, { ...DEFAULT_ADDITIONAL });
+  check('Evaluator was retried exactly once after invalid_response', provider.evaluatorAttempts === 2, String(provider.evaluatorAttempts));
+  check('Retry succeeding means no semanticError at all', result.semanticError === null, String(result.semanticError));
+  check('Retry succeeding means the real finding surfaces normally', result.findings.some(f => f.type === 'contradiction'), JSON.stringify(result.findings));
+  check('checkStatus reflects the recovered findings, not check_incomplete', result.checkStatus === 'findings', result.checkStatus);
+}
+
+// --- Retry must NOT fire for timeout/rate_limited — those are not the
+// "bad model draw emitted garbage" signature, and retrying them just
+// burns more of an already-tight time budget for low odds of success. ---
+class EvaluatorTimesOutOnce implements LLMProvider {
+  name = 'fake'; model = 'x';
+  evaluatorAttempts = 0;
+  async completeJSON<T>(prompt: string, opts?: any): Promise<T> {
+    const stage = opts?.stage;
+    if (stage === 'extraction') return ({ requirements: [] } as unknown) as T;
+    if (stage === 'evaluator') { this.evaluatorAttempts++; throw new LLMError('timeout', 'simulated timeout'); }
+    if (stage === 'verifier') return ({ verdicts: [], additional_findings: [] } as unknown) as T;
+    throw new Error('unexpected stage ' + stage);
+  }
+}
+
+async function testEvaluatorTimeoutIsNotRetried() {
+  const provider = new EvaluatorTimesOutOnce();
+  const providers: Providers = { extraction: provider, evaluator: provider, verifier: provider };
+  const result = await runPipeline(providers, REQUEST, OUTPUT, { ...DEFAULT_ADDITIONAL });
+  check('Evaluator timeout is attempted exactly once, not retried', provider.evaluatorAttempts === 1, String(provider.evaluatorAttempts));
+  check('semanticError reflects the timeout', result.semanticError === 'timeout', String(result.semanticError));
+}
+
+// --- Pipeline time budget: when almost no budget remains, a stage must
+// be SKIPPED gracefully (never attempted) rather than fired off with a
+// near-zero timeout, and this must degrade the same honest way any other
+// stage failure does (check_incomplete), never a silent clean result and
+// never an unhandled hang. ---
+class ShouldNeverBeCalledProvider implements LLMProvider {
+  name = 'fake'; model = 'x';
+  calls: string[] = [];
+  async completeJSON<T>(prompt: string, opts?: any): Promise<T> {
+    this.calls.push(opts?.stage);
+    throw new Error('this provider should never actually be called when the budget is exhausted');
+  }
+}
+
+async function testPipelineBudgetExhaustionSkipsGracefully() {
+  const prevBudget = process.env.PIPELINE_BUDGET_MS;
+  process.env.PIPELINE_BUDGET_MS = '0'; // no budget at all remains from t0
+  try {
+    const provider = new ShouldNeverBeCalledProvider();
+    const providers: Providers = { extraction: provider, evaluator: provider, verifier: provider };
+    const result = await runPipeline(providers, REQUEST, OUTPUT, { ...DEFAULT_ADDITIONAL });
+    check('No provider call is actually attempted once the budget is exhausted', provider.calls.length === 0, provider.calls.join(','));
+    check('Budget exhaustion degrades to check_incomplete, not a hang or a crash', result.checkStatus === 'check_incomplete', result.checkStatus);
+    check('Budget exhaustion is reported as a timeout-class semanticError', result.semanticError === 'timeout', String(result.semanticError));
+    check('No findings are fabricated when nothing actually ran', result.findings.filter(f => f.source === 'semantic').length === 0);
+  } finally {
+    if (prevBudget === undefined) delete process.env.PIPELINE_BUDGET_MS;
+    else process.env.PIPELINE_BUDGET_MS = prevBudget;
+  }
+}
+
 async function main() {
   await testExtractionNonFatal();
   await testEvaluatorFailureNeverClean();
@@ -216,6 +343,10 @@ async function main() {
   await testVerifierRejectsFalsePositive();
   await testVerifierCallFailureKeepsCandidatesUnverified();
   await testFabricatedEvidenceSuppressed();
+  await testVerifierIndependentScanRunsWhenEvaluatorFails();
+  await testEvaluatorRetryRecoversFromSingleBadDraw();
+  await testEvaluatorTimeoutIsNotRetried();
+  await testPipelineBudgetExhaustionSkipsGracefully();
   testJsonSalvage();
   console.log(`\n${pass} passed, ${fail} failed`);
   if (fail > 0) process.exit(1);

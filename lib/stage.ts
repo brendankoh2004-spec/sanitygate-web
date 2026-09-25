@@ -4,7 +4,7 @@ import { StageDiagnostic } from './types';
 /** Below this much remaining time a call has no realistic chance of finishing before the platform kills the function. */
 export const MIN_VIABLE_MS = 4000;
 /** A retry is only worth attempting with at least this much time left. */
-export const MIN_RETRY_MS = 6000;
+export const MIN_RETRY_MS = 10000;
 
 export type StageOutcome<T> =
   | { ok: true; value: T; partial: boolean; attempts: number }

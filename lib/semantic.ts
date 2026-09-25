@@ -89,6 +89,7 @@ const SEM_CATEGORIES = [
   'factual_contradiction',
   'unsupported_addition',
   'omission',
+  'unsupported_causal_claim',
 ] as const;
 
 const JUDGE_CATEGORIES = [

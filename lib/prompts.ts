@@ -141,25 +141,74 @@ ${output}`;
 // requirement ledger, no candidate list, so it cannot inherit a blind spot
 // from either.
 // ---------------------------------------------------------------------
-export function buildScanPrompt(request: string, output: string, measured: Measured, ctaRequired: boolean): string {
-  return `You are SanityGate's independent safety-net reviewer. Read the REQUEST and the OUTPUT yourself and report only MATERIAL failures. You have no list of expected issues; find them.
+export function buildScanPrompt(
+  request: string,
+  output: string,
+  measured: Measured,
+  ctaRequired: boolean,
+): string {
+  return `You are SanityGate's independent safety-net reviewer.
+
+Review the REQUEST against the OUTPUT independently. Do not assume the evaluator is correct, and do not look for style problems.
+
+Your job is to find only MATERIAL mismatches that could make the output fail the user's request.
+
 ${DATA_RULES}
 
-MEASURED FACTS (computed by code): the OUTPUT has ${measured.wordCount} words and ${measured.listItems} list items.${ctaRequired ? '\nThe user also requires that the OUTPUT include a clear call to action.' : ''}
+MEASURED FACTS (computed by code):
+- OUTPUT word count: ${measured.wordCount}
+- OUTPUT list items: ${measured.listItems}
+${ctaRequired ? '- The OUTPUT must include a clear call to action.' : ''}
 
-Look specifically for:
-1. direct contradictions of information in the REQUEST, including NEGATION errors (request says "not approved" / "has not been established" / "will not"; output says the affirmative, or vice versa);
-2. mandatory instructions from the REQUEST that the OUTPUT omits or breaks (including prohibited content, required elements, counts, order);
-3. reference information from the REQUEST that the OUTPUT changes — a wrong quantity or date, but ONLY when both refer to the same thing (same metric, period, entity);
-4. causal claims ("caused", "led to", "contributed to", "drove", "because of") the REQUEST does not establish, especially if it states only correlation/timing or denies causality;
-5. unsupported specific claims (figures, dates, capabilities, guarantees) on topics where the REQUEST provides reference facts.
+CHECK ONLY THESE FIVE CLASSES:
+
+1. CONTRADICTION
+The OUTPUT directly conflicts with something stated in the REQUEST.
+Include negation errors such as "not approved" vs "approved", "will not" vs "will", or "has not" vs "has".
+
+2. INSTRUCTION VIOLATION / OMISSION
+A mandatory requirement from the REQUEST is missing or broken.
+This includes required content, prohibited content, counts, order, and required formatting when explicitly requested.
+
+3. FACTUAL MISMATCH
+The OUTPUT changes a quantity, date, name, entity, or other reference fact from the REQUEST.
+Only flag this when both sides clearly refer to the same thing.
+
+4. UNSUPPORTED CAUSAL CLAIM
+The OUTPUT states or implies causation that the REQUEST does not establish.
+Examples include "caused", "led to", "because of", or "drove" when the REQUEST only establishes timing or correlation.
+
+5. UNSUPPORTED SPECIFIC CLAIM
+The OUTPUT adds a specific figure, date, capability, guarantee, or other concrete claim that is not supported by the REQUEST.
+
 ${EQUIVALENCE_RULES}
 
-Be conservative: an empty list is a normal, good answer. Report at most 8, most important first. Never flag style, tone, or wording. Each finding must include "not_equivalent_because" (why this is not a paraphrase/notation/format difference) and, for number/date/name issues, what each side refers to.
+IMPORTANT:
+- Be conservative.
+- Do not flag paraphrases, equivalent wording, formatting differences unless formatting is explicitly required, or harmless omissions.
+- Do not flag style or tone.
+- An empty findings list is valid.
+- Report at most 8 material findings.
+- Prioritise the clearest and most material findings.
+- Every finding must explain why it is not merely a paraphrase or equivalent representation.
+- For number/date/name issues, explain what each side refers to.
+- For factual contradictions, only flag the issue when the two statements concern the same subject.
+- Do not invent facts.
+- Fixes must make the smallest possible change and must not introduce new facts.
+
 ${QUOTE_RULES}
-"fix": smallest change, no new facts: "original" exact OUTPUT text, "replacement" new text ("" to delete); for an omission "insert_after" = exact OUTPUT sentence and "replacement" = text to add; otherwise null.
+
+For each finding:
+- "output_quote" must be exact text copied from OUTPUT, or "" for an omission.
+- "request_quote" must be exact text copied from REQUEST, or "" when no request passage is needed.
+- "not_equivalent_because" is mandatory.
+- "fix.original" must be exact OUTPUT text.
+- For omissions, use "insert_after" with an exact OUTPUT sentence.
+- Otherwise set unused fix fields to "".
 
 ${JSON_ONLY}
+
+Return ONLY this JSON shape:
 {"findings":[{"category":"instruction_violation|factual_contradiction|unsupported_addition|omission","severity":"critical|warning","output_quote":"exact OUTPUT passage or ''","request_quote":"exact REQUEST passage or ''","request_means":"","output_means":"","same_subject":"yes|no|unclear|n/a","not_equivalent_because":"","reason":"one short sentence","fix":{"original":"","replacement":"","insert_after":""}}]}
 
 --- REQUEST ---

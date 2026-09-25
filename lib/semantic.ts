@@ -338,7 +338,7 @@ export interface SemanticOutcome {
 const EVAL_BATCH = () =>
   Math.max(
     1,
-    Number(process.env.EVALUATOR_BATCH_SIZE) || 6,
+    Number(process.env.EVALUATOR_BATCH_SIZE) || 4,
   );
 const MAX_CLAIMS = 20;
 

@@ -346,9 +346,20 @@ export async function runSemanticReview(p: SemanticParams): Promise<SemanticOutc
   const hasRequest = !!request.trim();
   const measured = { wordCount: countWords(output), listItems: countListItems(output) };
 
-  const extractionDeadline = t0 + Math.min(10000, budgetMs * 0.2);
-  const evaluatorDeadline = t0 + Math.max(budgetMs - 15000, budgetMs * 0.6);
+  // Reserve a protected window for VERIFY + SCAN.
+  // Evaluation must never consume the time needed for the final
+  // independent verification layer.
+  const EXTRACTION_BUDGET_MS = 9000;
+  const VERIFICATION_RESERVE_MS = 18000;
+  
+  const extractionDeadline = Math.min(
+    t0 + EXTRACTION_BUDGET_MS,
+    t0 + budgetMs - VERIFICATION_RESERVE_MS,
+  );
+  
+  const evaluatorDeadline = t0 + budgetMs - VERIFICATION_RESERVE_MS;
   const finalDeadline = t0 + budgetMs;
+  
 
   // ---- analysing -----------------------------------------------------
   p.onStage?.('analysing');

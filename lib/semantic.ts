@@ -335,7 +335,11 @@ export interface SemanticOutcome {
   counts: Record<string, number>;
 }
 
-const EVAL_BATCH = () => Math.max(1, Number(process.env.EVALUATOR_BATCH_SIZE) || 10);
+const EVAL_BATCH = () =>
+  Math.max(
+    1,
+    Number(process.env.EVALUATOR_BATCH_SIZE) || 8,
+  );
 const MAX_CLAIMS = 20;
 
 export async function runSemanticReview(p: SemanticParams): Promise<SemanticOutcome> {
@@ -357,9 +361,10 @@ export async function runSemanticReview(p: SemanticParams): Promise<SemanticOutc
     t0 + budgetMs - VERIFICATION_RESERVE_MS,
   );
   
-  const evaluatorDeadline = t0 + budgetMs - VERIFICATION_RESERVE_MS;
-  const finalDeadline = t0 + budgetMs;
+  const evaluatorDeadline =
+    t0 + budgetMs - VERIFICATION_RESERVE_MS;
   
+  const finalDeadline = t0 + budgetMs;  
 
   // ---- analysing -----------------------------------------------------
   p.onStage?.('analysing');
@@ -393,7 +398,7 @@ export async function runSemanticReview(p: SemanticParams): Promise<SemanticOutc
       name: batches.length > 1 ? `evaluator[${bi + 1}/${batches.length}]` : 'evaluator',
       provider: providers.evaluator,
       prompt: buildEvaluatorPrompt(request, output, batch, measured, bi === 0),
-      desiredMs: 22000, deadline: evaluatorDeadline, maxTokens: 2600, diagnostics,
+      desiredMs: 18000, deadline: evaluatorDeadline, maxTokens: 2600, diagnostics,
       validate: makeEvaluatorValidator(batch.map(b => b.id), bi === 0),
     })));
     outcomes.forEach((o, bi) => {

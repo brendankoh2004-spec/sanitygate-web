@@ -435,7 +435,7 @@ export async function runSemanticReview(p: SemanticParams): Promise<SemanticOutc
       : Promise.resolve(null),
     runStage<RawFinding[]>({
       name: 'scan', provider: providers.verifier, prompt: buildScanPrompt(request, output, measured, adv.cta),
-      desiredMs: 20000, deadline: finalDeadline, maxTokens: 2400, diagnostics, validate: validateScan,
+      desiredMs: 20000, deadline: finalDeadline, maxTokens: 1200, diagnostics, validate: validateScan,
     }),
   ]);
 

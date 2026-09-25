@@ -43,44 +43,132 @@ export async function runStage<T>(spec: StageSpec<T>): Promise<StageOutcome<T>> 
   let partialValue: T | null = null;
 
   const record = (ok: boolean, code: string | null, partial: boolean) => {
-    spec.diagnostics.push({ stage: spec.name, ok, code, attempts, ms: Date.now() - t0, partial, model: spec.provider.model });
+    spec.diagnostics.push({
+      stage: spec.name,
+      ok,
+      code,
+      attempts,
+      ms: Date.now() - t0,
+      partial,
+      model: spec.provider.model,
+    });
   };
 
   while (attempts < 2) {
     const remaining = spec.deadline - Date.now();
-    if (remaining < (attempts === 0 ? MIN_VIABLE_MS : MIN_RETRY_MS)) {
+
+    // First attempt needs a realistic amount of time.
+    // Retry needs less because it is a recovery attempt and must
+    // not consume the protected time of later pipeline stages.
+    const minimumRequired =
+      attempts === 0 ? MIN_VIABLE_MS : MIN_RETRY_MS;
+
+    if (remaining < minimumRequired) {
       if (attempts === 0) {
-        console.error(`[sanitygate:${spec.name}] skipped — insufficient time budget`);
+        console.error(
+          `[sanitygate:${spec.name}] skipped — insufficient time budget`,
+        );
         lastCode = 'timeout';
+      } else {
+        console.error(
+          `[sanitygate:${spec.name}] retry skipped — insufficient time budget`,
+        );
       }
       break;
     }
+
     attempts++;
+
+    // First attempt gets the normal desired budget.
+    // Retry gets at most 8 seconds, preventing a second long model call
+    // from consuming the remaining pipeline budget.
+    const timeoutMs =
+      attempts === 1
+        ? Math.min(spec.desiredMs, remaining)
+        : Math.min(8000, remaining);
+
     try {
-      const r = await spec.provider.completeJSON<unknown>(spec.prompt, {
-        temperature: 0.1, maxTokens: spec.maxTokens, timeoutMs: Math.min(spec.desiredMs, remaining), stage: spec.name,
-      });
+      const r = await spec.provider.completeJSON<unknown>(
+        spec.prompt,
+        {
+          temperature: 0.1,
+          maxTokens: spec.maxTokens,
+          timeoutMs,
+          stage: spec.name,
+        },
+      );
+
       const v = spec.validate(r?.value);
-      if (!v) { lastCode = 'invalid_response'; console.error(`[sanitygate:${spec.name}] attempt ${attempts}: unusable response shape`); continue; }
-      if (r.partial || !v.complete) {
-        partialValue = v.value; lastCode = 'invalid_response';
-        console.error(`[sanitygate:${spec.name}] attempt ${attempts}: incomplete response (${r.partial ? 'truncated' : 'coverage gap'})`);
+
+      if (!v) {
+        lastCode = 'invalid_response';
+
+        console.error(
+          `[sanitygate:${spec.name}] attempt ${attempts}: unusable response shape`,
+        );
+
+        // Don't spend another long call recovering a completely
+        // unusable response unless enough time remains.
         continue;
       }
+
+      if (r.partial || !v.complete) {
+        partialValue = v.value;
+        lastCode = 'invalid_response';
+
+        console.error(
+          `[sanitygate:${spec.name}] attempt ${attempts}: incomplete response ` +
+          `(${r.partial ? 'truncated' : 'coverage gap'})`,
+        );
+
+        continue;
+      }
+
       record(true, null, false);
-      return { ok: true, value: v.value, partial: false, attempts };
+
+      return {
+        ok: true,
+        value: v.value,
+        partial: false,
+        attempts,
+      };
     } catch (e) {
-      const code = e instanceof LLMError ? e.code : 'upstream_error';
+      const code =
+        e instanceof LLMError ? e.code : 'upstream_error';
+
       lastCode = code;
-      console.error(`[sanitygate:${spec.name}] attempt ${attempts} failed: ${code}`);
-      if (code === 'timeout' || code === 'rate_limited') break;
+
+      console.error(
+        `[sanitygate:${spec.name}] attempt ${attempts} failed: ${code}`,
+      );
+
+      // Timeout and rate-limit are not retried.
+      // A retry cannot realistically improve the result inside
+      // the remaining pipeline budget.
+      if (code === 'timeout' || code === 'rate_limited') {
+        break;
+      }
     }
   }
 
+  // A partial result is explicitly marked partial.
+  // It is never silently promoted to a complete result.
   if (partialValue !== null) {
     record(true, 'partial', true);
-    return { ok: true, value: partialValue, partial: true, attempts };
+
+    return {
+      ok: true,
+      value: partialValue,
+      partial: true,
+      attempts,
+    };
   }
+
   record(false, lastCode, false);
-  return { ok: false, code: lastCode, attempts };
+
+  return {
+    ok: false,
+    code: lastCode,
+    attempts,
+  };
 }

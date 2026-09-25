@@ -34,6 +34,7 @@ export type FindingCategory =
   | 'instruction_violation'   // output breaks/ignores an explicit instruction or prohibition
   | 'factual_contradiction'   // output states something different from reference information in the request
   | 'unsupported_addition'    // output asserts something (incl. causal claims) the request does not support
+  | 'unsupported_causal_claim'
   | 'omission'                // output leaves out something the request required
   | 'structural';             // deterministic hardcoded check
 

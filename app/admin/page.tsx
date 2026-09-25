@@ -67,9 +67,19 @@ export default function AdminPage() {
             <div className="stat-card"><div className="sn">{stats.quality.sourceUsedPct}%</div><div className="sl">Checks with source</div></div>
             <div className="stat-card"><div className="sn">{stats.quality.usefulPct ?? '—'}{stats.quality.usefulPct != null ? '%' : ''}</div><div className="sl">Said review was useful</div></div>
             <div className="stat-card"><div className="sn">{stats.quality.caughtRealPct ?? '—'}{stats.quality.caughtRealPct != null ? '%' : ''}</div><div className="sl">Caught something real</div></div>
-            <div className="stat-card"><div className="sn">{stats.quality.falsePositiveRate ?? '—'}{stats.quality.falsePositiveRate != null ? '%' : ''}</div><div className="sl">User-reported false positives</div></div>
-            <div className="stat-card"><div className="sn">{stats.quality.semanticFailPct}%</div><div className="sl">Semantic review failures</div></div>
+            <div className="stat-card"><div className="sn">{stats.quality.suggestionsAcceptedPct ?? '—'}{stats.quality.suggestionsAcceptedPct != null ? '%' : ''}</div><div className="sl">Suggestions accepted (vs ignored)</div></div>
+            <div className="stat-card"><div className="sn">{stats.quality.incompletePct}%</div><div className="sl">Incomplete reviews</div></div>
           </div>
+          {stats.findingOrigins && stats.findingOrigins.length > 0 && (
+            <div style={{ marginTop: 24 }}>
+              <h2 style={{ fontSize: 16.5 }}>Finding origin (internal)</h2>
+              {stats.findingOrigins.map(([t, v]: [string, number]) => (
+                <div key={t} className="bar-row"><span className="bar-label">{t}</span>
+                  <div className="bar-track"><div className="bar-fill" style={{ width: `${Math.round(v / stats.findingOrigins[0][1] * 100)}%` }} /></div>
+                  <span style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>{v}</span></div>
+              ))}
+            </div>
+          )}
           {stats.findingTypes.length > 0 && (
             <div style={{ marginTop: 24 }}>
               <h2 style={{ fontSize: 16.5 }}>Finding types</h2>

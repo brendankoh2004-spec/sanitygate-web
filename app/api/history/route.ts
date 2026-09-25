@@ -1,27 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getSupabase } from '@/lib/supabase';
+import { fromDbRow } from '@/lib/records';
 
 export const runtime = 'nodejs';
-
-// Mirrors the full `checks` table shape (db/schema.sql) since this route
-// selects '*'. Explicit on purpose — see app/api/admin/stats/route.ts for
-// why we don't rely on inferring row shapes through the query builder.
-interface CheckRow {
-  id: string;
-  session_id: string;
-  created_at: string;
-  request: string;
-  output: string;
-  additional: unknown;
-  extracted_requirements: unknown;
-  findings: unknown;
-  passed_checks: unknown;
-  word_count: number;
-  duration_ms: number;
-  semantic_error: string | null;
-  has_reference: boolean;
-  check_status: string | null;
-}
 
 export async function GET(req: NextRequest) {
   const sessionId = req.nextUrl.searchParams.get('sessionId');
@@ -30,22 +11,18 @@ export async function GET(req: NextRequest) {
   const supabase = getSupabase();
   if (!supabase) return NextResponse.json({ checks: [], persistenceAvailable: false });
 
+  // Explicit column list (never select('*')) so internal columns such as
+  // `diagnostics` and `semantic_error` can never reach the browser.
   const { data, error } = await supabase
     .from('checks')
-    .select('*')
+    .select('id, session_id, created_at, request, output, additional, extracted_requirements, findings, passed_checks, word_count, duration_ms, has_reference, check_status, semantic_error')
     .eq('session_id', sessionId)
     .order('created_at', { ascending: false })
     .limit(50);
 
-  if (error) return NextResponse.json({ checks: [], persistenceAvailable: true, error: error.message }, { status: 500 });
-
-  const checks = ((data || []) as CheckRow[]).map((row: CheckRow) => ({
-    id: row.id, sessionId: row.session_id, createdAt: row.created_at,
-    request: row.request, output: row.output, additional: row.additional,
-    extractedRequirements: row.extracted_requirements,
-    findings: row.findings, passedChecks: row.passed_checks, wordCount: row.word_count,
-    durationMs: row.duration_ms, semanticError: row.semantic_error, hasReference: row.has_reference,
-    checkStatus: row.check_status,
-  }));
-  return NextResponse.json({ checks, persistenceAvailable: true });
+  if (error) {
+    console.error('[sanitygate:history] query failed:', error.message);
+    return NextResponse.json({ checks: [], persistenceAvailable: true, error: 'history_unavailable' }, { status: 500 });
+  }
+  return NextResponse.json({ checks: (data || []).map(fromDbRow), persistenceAvailable: true });
 }

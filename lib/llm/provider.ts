@@ -9,40 +9,33 @@ export class LLMError extends Error {
   }
 }
 
-/** Which stage of the pipeline is calling the provider. Evaluator and
- * verifier can be configured to use different models/providers
- * independently (spec section 24) — extraction shares the evaluator's
- * model by default since it's conceptually the first half of the same
- * "understand + judge" job, but that's a default, not a constraint. */
+/** Pipeline stage using the provider. Each can be pointed at a different model (optional). */
 export type LLMRole = 'extraction' | 'evaluator' | 'verifier';
 
 export interface LLMJsonOptions {
-  /** Lower temperature for more deterministic structured output. */
   temperature?: number;
   maxTokens?: number;
-  /** Abort the call after this many ms. */
+  /** Aborts the whole call (headers AND body) after this many ms. */
   timeoutMs?: number;
-  /** Purely a label for server-side diagnostics (e.g. 'extraction',
-   * 'evaluator', 'verifier') — never sent to the provider, never
-   * included in any user-facing output. Lets failure logs say which
-   * pipeline stage broke without needing to log prompt/response content. */
+  /** Diagnostics label only; never sent to the provider. */
   stage?: string;
 }
 
+export interface LLMJsonResult<T = unknown> {
+  value: T;
+  /** true = the response was truncated/malformed and only a repaired prefix was recovered. Callers must not treat a partial result as complete. */
+  partial: boolean;
+}
+
 /**
- * Provider-agnostic interface. Every provider implementation must:
- *  - accept a single text prompt (system framing is baked into the prompt
- *    string by the caller — see lib/prompts.ts — since not every free
- *    model / API supports a separate system role reliably)
- *  - return parsed JSON matching whatever shape the caller asked for in
- *    the prompt
- *  - throw LLMError with a specific code on failure, NEVER return a
- *    silently-empty/successful result on failure. This is load-bearing:
- *    the pipeline treats "no error thrown, empty issues array" as a
- *    genuine clean result, and "error thrown" as "could not evaluate".
+ * Provider contract:
+ *  - returns parsed JSON (possibly partial), or
+ *  - throws LLMError. NEVER returns a silently-empty success on failure —
+ *    the pipeline treats "returned" as "the model answered" and "threw" as
+ *    "could not evaluate".
  */
 export interface LLMProvider {
   readonly name: string;
   readonly model: string;
-  completeJSON<T = unknown>(prompt: string, opts?: LLMJsonOptions): Promise<T>;
+  completeJSON<T = unknown>(prompt: string, opts?: LLMJsonOptions): Promise<LLMJsonResult<T>>;
 }

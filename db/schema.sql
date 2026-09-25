@@ -17,7 +17,7 @@
 --  * Findings are stored as JSONB inside `checks` rather than a separate
 --    table, since they're always read/written as a whole unit per check
 --    and never queried individually across checks. Per-finding feedback
---    (correct / false positive) references the finding's client-generated
+--    (accepted / ignored / undone) references the finding's client-generated
 --    id as text.
 --  * Raw source/output text IS stored in `checks` (needed to re-render
 --    history). This is called out explicitly in the privacy notice.
@@ -42,7 +42,8 @@ create table if not exists checks (
   duration_ms int not null default 0,
   semantic_error text,
   has_reference boolean not null default false,
-  check_status text not null default 'clean'  -- 'clean'|'findings'|'needs_review'|'check_incomplete' — see lib/types.ts CheckStatus. A failed/incomplete semantic check must never be indistinguishable from a genuinely clean one.
+  check_status text not null default 'clean',  -- 'clean'|'findings'|'needs_review'|'check_incomplete' — see lib/types.ts CheckStatus. A failed/incomplete semantic check must never be indistinguishable from a genuinely clean one.
+  diagnostics jsonb not null default '{}'::jsonb  -- internal only: per-stage outcomes (ok/code/attempts/ms/model), notes and counters. NEVER selected by app/api/history (see its explicit column list) — for engineers debugging via Supabase directly, not for the browser.
 );
 create index if not exists checks_session_idx on checks (session_id, created_at desc);
 create index if not exists checks_created_idx on checks (created_at desc);
@@ -60,8 +61,7 @@ create table if not exists finding_feedback (
   id uuid primary key default gen_random_uuid(),
   check_id text not null references checks(id) on delete cascade,
   finding_id text not null,
-  verdict text not null, -- 'correct' | 'false_positive'
-  suggestion_useful boolean,
+  verdict text not null, -- 'accepted' | 'ignored' | 'undone' (legacy rows may still say 'correct' | 'false_positive')
   created_at timestamptz not null default now()
 );
 

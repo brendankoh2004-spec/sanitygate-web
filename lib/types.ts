@@ -1,77 +1,83 @@
+// =====================================================================
+// SanityGate core types (pilot architecture)
+//
+// Responsibilities:
+//   * deterministic layer  -> only hardcoded structural checks
+//                             (word count, required/forbidden terms, list
+//                             format, leftover placeholders)
+//   * semantic layer       -> everything that needs understanding:
+//                             instruction following, facts, numbers/dates
+//                             in context, contradictions, causal claims
+//   * verifier             -> independent verification + independent scan
+// =====================================================================
+
 // ---------------------------------------------------------------------
-// Requirement extraction (lib/prompts.ts buildExtractionPrompt / lib/pipeline.ts)
+// Requirement ledger — the request split into individually judgeable items
 // ---------------------------------------------------------------------
-// The user's first box ("what did you ask the AI to do?") is a single
-// free-text blob that may contain instructions, reference facts, or
-// both. Extraction turns it into a structured, auditable list BEFORE
-// any compliance judgment is made — this is what lets the golden tests
-// grade "did SanityGate even understand the request" separately from
-// "did SanityGate judge compliance correctly".
+export type RequirementKind = 'instruction' | 'fact' | 'unclassified';
+export type RequirementCategory = 'content' | 'prohibition' | 'format' | 'quantity' | 'order' | 'length' | 'other';
 
-export type RequirementType =
-  | 'length'            // e.g. "<=500 words"
-  | 'required_content'  // e.g. "must discuss implementation"
-  | 'quantity'          // e.g. "exactly 5 recommendations"
-  | 'format'            // e.g. "use bullet points"
-  | 'prohibition'       // e.g. "do not mention pricing"
-  | 'order'             // e.g. "explain the problem before the solution"
-  | 'fact';             // reference information the output must stay consistent with, not an instruction
-
-export type QuantityKind = 'exactly' | 'at_least' | 'no_more_than';
-
-export interface ExtractedRequirement {
-  type: RequirementType;
-  text: string;               // requirement in the model's own words, kept short
-  quantityKind?: QuantityKind; // only for type === 'quantity'
-  quantityValue?: number;      // only for type === 'quantity'
-}
-
-export interface ExtractionResult {
-  requirements: ExtractedRequirement[];
+export interface RequirementItem {
+  id: string;                          // R1, R2, ... (document order)
+  kind: RequirementKind;               // unclassified = a request sentence extraction did not cover; the evaluator classifies it
+  category: RequirementCategory | null;
+  text: string;                        // concise restatement (facts name what each figure refers to)
+  quote: string;                       // verbatim text from the REQUEST ('' only for the synthetic CTA item)
+  quoteStart: number | null;           // validated span in the request
+  quoteEnd: number | null;
 }
 
 // ---------------------------------------------------------------------
 // Findings
 // ---------------------------------------------------------------------
-
-export type FindingType =
-  | 'missing_requirement'
-  | 'requirement_violation'
-  | 'contradiction'
-  | 'unsupported_claim'
-  | 'source_mismatch'
-  | 'numerical_mismatch'
-  | 'entity_mismatch'
-  | 'format_violation';
+export type FindingCategory =
+  | 'instruction_violation'   // output breaks/ignores an explicit instruction or prohibition
+  | 'factual_contradiction'   // output states something different from reference information in the request
+  | 'unsupported_addition'    // output asserts something (incl. causal claims) the request does not support
+  | 'omission'                // output leaves out something the request required
+  | 'structural';             // deterministic hardcoded check
 
 export type Severity = 'critical' | 'warning';
 
+/** Internal provenance — used for testing/debugging/analytics, never shown in the UI. */
+export type FindingOrigin = 'deterministic' | 'evaluator' | 'verifier_scan' | 'evaluator+scan';
+export type FindingVerification =
+  | 'not_applicable'          // deterministic
+  | 'confirmed'               // verifier independently confirmed with its own grounded evidence
+  | 'uncertain'               // verifier could not decide
+  | 'rejected_corroborated'   // verifier rejected, but an independent scan re-found it
+  | 'unverified'              // verifier did not produce a usable verdict
+  | 'scan_only';              // found only by the independent scan, never seen by the evaluator
+
+/** A targeted change against the ORIGINAL output. Offsets never move. */
+export interface TextEdit {
+  start: number;
+  end: number;              // start === end -> pure insertion
+  original: string;         // exactly output.slice(start, end)
+  replacement: string;      // '' -> removal
+}
+
+export interface Passage { start: number; end: number; text: string }
+
 export interface Finding {
   id: string;
-  type: FindingType;
+  category: FindingCategory;
   severity: Severity;
-  confidence: number; // 0..1
-  source: 'deterministic' | 'semantic';
-  start: number | null;
-  end: number | null;
-  matchedText: string | null;
-  reason: string;
-  evidence: string | null;       // short quote from the user's original box, if applicable
-  requirement: string | null;    // the specific extracted requirement this relates to
-  suggestion: string | null;
-  suggestionVerified: boolean;   // false = a suggestion existed but failed verification and was dropped
-  status: 'open' | 'dismissed' | 'applied';
-  userVerdict: 'correct' | 'false_positive' | null;
-  needsReview: boolean;
-  evidenceValidated: boolean;    // true only if evidence text was programmatically confirmed to exist in the input
+  /** 'confirmed' = evaluator+verifier (or evaluator+independent scan) agree with grounded evidence. */
+  strength: 'confirmed' | 'uncertain';
+  origin: FindingOrigin;
+  verification: FindingVerification;
+  passage: Passage | null;          // programmatically located in the real output; text is sliced from the output, never model-supplied
+  requirementQuote: string | null;  // programmatically located in the real request
+  requirement: string | null;       // short human description of the requirement/fact concerned
+  reason: string;                   // one concise sentence
+  suggestion: string | null;        // human-readable suggested wording / advice
+  edit: TextEdit | null;            // present only if the suggestion can be applied as a targeted edit
 }
 
 // ---------------------------------------------------------------------
-// Additional checks — deliberately small and objective (spec section 4/16/31).
-// No tone/quality/conciseness/"AI-ness" options. "Must include a CTA" is
-// judgment-based (not reliably regex-able) so it's folded into the
-// extracted requirements and evaluated semantically rather than by code;
-// everything else here is evaluated by code alone.
+// Additional checks — deterministic ones only, plus the CTA toggle which is
+// routed to the semantic layer as a requirement.
 // ---------------------------------------------------------------------
 export interface AdditionalChecks {
   cta: boolean;
@@ -96,39 +102,83 @@ export const DEFAULT_ADDITIONAL: AdditionalChecks = {
   minWords: false, minWordsVal: 50,
 };
 
+/** Never trust the shape of client-supplied settings. */
+export function sanitizeAdditional(raw: unknown): AdditionalChecks {
+  const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  const bool = (k: keyof AdditionalChecks) => r[k] === true;
+  const str = (k: keyof AdditionalChecks) => (typeof r[k] === 'string' ? (r[k] as string).slice(0, 1000) : '');
+  const num = (k: keyof AdditionalChecks, d: number) => {
+    const v = Number(r[k]);
+    return Number.isFinite(v) && v >= 0 && v <= 1_000_000 ? Math.floor(v) : d;
+  };
+  return {
+    cta: bool('cta'), bulletFormat: bool('bulletFormat'), numberedFormat: bool('numberedFormat'),
+    requiredTerms: bool('requiredTerms'), requiredTermsVal: str('requiredTermsVal'),
+    forbiddenTerms: bool('forbiddenTerms'), forbiddenTermsVal: str('forbiddenTermsVal'),
+    maxWords: bool('maxWords'), maxWordsVal: num('maxWordsVal', DEFAULT_ADDITIONAL.maxWordsVal),
+    minWords: bool('minWords'), minWordsVal: num('minWordsVal', DEFAULT_ADDITIONAL.minWordsVal),
+  };
+}
+
 // ---------------------------------------------------------------------
-// Part 6 product guarantee: four explicit states, never conflated.
-// CHECK_INCOMPLETE must never be presented as CLEAN — a failed checker
-// is not a clean document. Computed once in lib/pipeline.ts and carried
-// through persistence so it's auditable after the fact, not just an
-// in-memory UI computation.
+// Status model — four explicit states, never conflated.
+//   clean            review fully completed, nothing found
+//   findings         review fully completed, at least one confirmed finding
+//   needs_review     review fully completed, everything found is uncertain
+//   check_incomplete some part of the review could not be completed or
+//                    verified. NEVER presented as clean, even with zero findings.
 // ---------------------------------------------------------------------
 export type CheckStatus = 'clean' | 'findings' | 'needs_review' | 'check_incomplete';
+export type CheckStage = 'analysing' | 'reviewing' | 'verifying' | 'finalising';
+/** The only failure vocabulary the user ever sees. */
+export type IncompleteReason = 'busy' | 'timeout' | 'general';
+
+// ---------------------------------------------------------------------
+// Internal diagnostics (persisted, never sent to the browser)
+// ---------------------------------------------------------------------
+export interface StageDiagnostic {
+  stage: string;
+  ok: boolean;
+  code: string | null;     // rate_limited | timeout | upstream_error | invalid_response | ...
+  attempts: number;
+  ms: number;
+  partial: boolean;
+  model?: string;
+}
+export interface PipelineDiagnostics {
+  stages: StageDiagnostic[];
+  notes: string[];
+  counts: Record<string, number>;
+}
 
 export interface PipelineResult {
   findings: Finding[];
   passedChecks: string[];
   wordCount: number;
   durationMs: number;
-  semanticError: string | null;
-  hasReference: boolean; // true if the first box contained anything at all
-  extractedRequirements: ExtractedRequirement[];
+  hasReference: boolean;
+  requirements: RequirementItem[];
   checkStatus: CheckStatus;
+  incompleteReason: IncompleteReason | null;
+  /** Internal failure code (first failing stage). Stored in DB, NOT sent to the browser. */
+  semanticError: string | null;
+  diagnostics: PipelineDiagnostics;
 }
 
+/** What the browser receives / what history returns. */
 export interface CheckRecord {
   id: string;
   sessionId: string;
   createdAt: string;
-  request: string;   // "what did you ask the AI to do?" — the single input box
-  output: string;
+  request: string;
+  output: string;              // always the ORIGINAL output
   additional: AdditionalChecks;
   findings: Finding[];
   passedChecks: string[];
   wordCount: number;
   durationMs: number;
-  semanticError: string | null;
   hasReference: boolean;
-  extractedRequirements: ExtractedRequirement[];
+  requirements: RequirementItem[];
   checkStatus: CheckStatus;
+  incompleteReason: IncompleteReason | null;
 }

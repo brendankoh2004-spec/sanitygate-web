@@ -1,7 +1,9 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { Finding, AdditionalChecks, DEFAULT_ADDITIONAL, CheckRecord } from '@/lib/types';
+import { Finding, AdditionalChecks, DEFAULT_ADDITIONAL, CheckRecord, CheckStage, IncompleteReason } from '@/lib/types';
+import { buildSegments, MarkInput } from '@/lib/edits';
+import { createNdjsonParser, StreamEvent } from '@/lib/stream';
 
 type View = 'landing' | 'check' | 'result' | 'history';
 
@@ -43,14 +45,29 @@ You can start your free trial today with no commitment. A credit card is require
 Best,
 The Atlas Team`;
 
-function typeLabel(t: string) {
-  return ({
-    missing_requirement: 'Missing requirement', requirement_violation: 'Requirement violation',
-    contradiction: 'Contradiction', unsupported_claim: 'Unsupported claim', source_mismatch: 'Source mismatch',
-    numerical_mismatch: 'Numerical mismatch', entity_mismatch: 'Entity mismatch', format_violation: 'Format / constraint',
-  } as Record<string, string>)[t] || 'Potential issue';
+// ---------------------------------------------------------------------
+// Four product-facing stages (spec section 9). No internal pipeline
+// terminology ("Call 1", "deterministic validator", ...) ever appears here.
+// ---------------------------------------------------------------------
+const STAGES: { key: CheckStage; label: string }[] = [
+  { key: 'analysing', label: 'Analysing' },
+  { key: 'reviewing', label: 'Reviewing' },
+  { key: 'verifying', label: 'Verifying' },
+  { key: 'finalising', label: 'Finalising' },
+];
+
+function StageProgress({ current }: { current: CheckStage | null }) {
+  const idx = current ? STAGES.findIndex(s => s.key === current) : -1;
+  return (
+    <div className="stage-progress">
+      {STAGES.map((s, i) => (
+        <div key={s.key} className={`stage-step ${i < idx ? 'done' : i === idx ? 'active' : 'pending'}`}>
+          <span className="stage-dot" />{s.label}
+        </div>
+      ))}
+    </div>
+  );
 }
-function isHigh(f: Finding) { return !f.needsReview; }
 
 export default function Page() {
   const sessionId = useSessionId();
@@ -61,9 +78,9 @@ export default function Page() {
   const [additional, setAdditional] = useState<AdditionalChecks>({ ...DEFAULT_ADDITIONAL });
 
   const [running, setRunning] = useState(false);
-  const [runStage, setRunStage] = useState('');
+  const [stage, setStage] = useState<CheckStage | null>(null);
   const [result, setResult] = useState<CheckRecord | null>(null);
-  const [showCorrected, setShowCorrected] = useState(false);
+  const [persisted, setPersisted] = useState(true);
   const [feedback, setFeedback] = useState<{ useful?: boolean; caughtReal?: string; comment?: string }>({});
   const [history, setHistory] = useState<CheckRecord[] | null>(null);
   const [errorMsg, setErrorMsg] = useState('');
@@ -80,38 +97,57 @@ export default function Page() {
     if (!output.trim()) { setErrorMsg('Paste the AI output to check first.'); return; }
     setErrorMsg('');
     setRunning(true);
-    setRunStage('Understanding what you asked for…');
+    setStage('analysing');
     try {
-      const stageTimer1 = setTimeout(() => setRunStage('Comparing the output against your request…'), 900);
-      const stageTimer2 = setTimeout(() => setRunStage('Verifying each finding…'), 2400);
       const res = await fetch('/api/check', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessionId, request, output, additional }),
       });
-      clearTimeout(stageTimer1); clearTimeout(stageTimer2);
       if (res.status === 429) {
-        const j = await res.json().catch(() => ({}));
-        setErrorMsg(j.message || 'SanityGate has temporarily reached its free AI capacity. Please try again later.');
-        setRunning(false);
+        const j = await res.json().catch(() => ({} as any));
+        setErrorMsg(j.message || 'SanityGate has reached its capacity for now. Please try again later.');
+        setRunning(false); setStage(null);
         return;
       }
       if (!res.ok) {
-        const j = await res.json().catch(() => ({}));
+        const j = await res.json().catch(() => ({} as any));
         setErrorMsg(j.message || 'Something went wrong running the check. Please try again.');
-        setRunning(false);
+        setRunning(false); setStage(null);
         return;
       }
-      const rec: CheckRecord = await res.json();
-      setResult(rec);
-      setShowCorrected(false);
+      if (!res.body) { setErrorMsg('Something went wrong running the check. Please try again.'); setRunning(false); setStage(null); return; }
+
+      let finalRecord: CheckRecord | null = null;
+      let finalPersisted = true;
+      let sawError = false;
+      const parser = createNdjsonParser((e: StreamEvent) => {
+        if (e.type === 'stage') setStage(e.stage);
+        else if (e.type === 'result') { finalRecord = e.record; finalPersisted = e.persisted; }
+        else if (e.type === 'error') sawError = true;
+      });
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) { parser.end(); break; }
+        parser.push(decoder.decode(value, { stream: true }));
+      }
+      if (sawError || !finalRecord) {
+        setErrorMsg('Something went wrong running the check. Please try again.');
+        setRunning(false); setStage(null);
+        return;
+      }
+      setResult(finalRecord);
+      setPersisted(finalPersisted);
       setFeedback({});
       setView('result');
       setHistory(null);
     } catch (e) {
       setErrorMsg('Network error running the check. Please try again.');
     }
-    setRunning(false);
+    setRunning(false); setStage(null);
   }
 
   const loadHistory = useCallback(async () => {
@@ -123,18 +159,10 @@ export default function Page() {
 
   useEffect(() => { if (view === 'history' && history === null) loadHistory(); }, [view, history, loadHistory]);
 
-  function updateFinding(id: string, patch: Partial<Finding>) {
-    if (!result) return;
-    const findings = result.findings.map(f => f.id === id ? { ...f, ...patch } : f);
-    setResult({ ...result, findings });
-  }
-
-  async function sendFindingFeedback(f: Finding, verdict: 'correct' | 'false_positive') {
-    updateFinding(f.id, { userVerdict: verdict });
-    if (!result) return;
+  function sendFindingFeedback(checkId: string, findingId: string, decision: 'accepted' | 'ignored' | 'undone') {
     fetch('/api/feedback', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ checkId: result.id, kind: 'finding', findingId: f.id, verdict }),
+      body: JSON.stringify({ checkId, kind: 'finding', findingId, decision }),
     }).catch(() => {});
   }
 
@@ -157,22 +185,20 @@ export default function Page() {
           request={request} setRequest={setRequest} output={output} setOutput={setOutput}
           checksOpen={checksOpen} setChecksOpen={setChecksOpen}
           additional={additional} setAdditional={setAdditional}
-          running={running} runStage={runStage} errorMsg={errorMsg}
+          running={running} stage={stage} errorMsg={errorMsg}
           onRun={runCheck}
         />
       )}
       {view === 'result' && result && (
         <ResultScreen
-          result={result} showCorrected={showCorrected} setShowCorrected={setShowCorrected}
-          onDismiss={(id) => updateFinding(id, { status: 'dismissed' })}
-          onApply={(id) => updateFinding(id, { status: 'applied' })}
-          onUndo={(id) => updateFinding(id, { status: 'open' })}
-          onVerdict={sendFindingFeedback}
+          key={result.id}
+          result={result} persisted={persisted}
+          onFindingDecision={sendFindingFeedback}
           feedback={feedback} onFeedback={sendReviewFeedback}
           onNewCheck={() => { resetDraft(); setView('check'); }}
         />
       )}
-      {view === 'history' && <HistoryScreen history={history} onOpen={(rec) => { setResult(rec); setFeedback({}); setShowCorrected(false); setView('result'); }} onRunFirst={() => { resetDraft(); setView('check'); }} />}
+      {view === 'history' && <HistoryScreen history={history} onOpen={(rec) => { setResult(rec); setPersisted(true); setFeedback({}); setView('result'); }} onRunFirst={() => { resetDraft(); setView('check'); }} />}
     </>
   );
 }
@@ -215,26 +241,27 @@ function Landing({ onTry, onExample }: { onTry: () => void; onExample: () => voi
           </div>
         </div>
         <div className="demo-card">
-          <div className="label">What you asked for</div>
-          <div className="src-box">&quot;...mention the price ($24/user/month)...&quot;</div>
-          <div className="label">What the AI generated</div>
+          <div className="label">Generated</div>
           <div>&quot;The Business plan is available for just <mark className="mk-critical">$19/user/month</mark> and includes seamless <mark className="mk-warning">Slack integration</mark>.&quot;</div>
           <div style={{ marginTop: 12, borderTop: '1px dashed var(--border)', paddingTop: 10, fontSize: 13 }}>
-            <strong>Price does not match what you asked for</strong><br />
-            <span style={{ color: 'var(--ink-soft)' }}>Your request says $24/user/month.</span><br />
-            <span style={{ color: 'var(--accent-ink)', fontFamily: 'var(--mono)' }}>Suggested: change to &quot;$24/user/month&quot; · High confidence</span>
+            <div className="label" style={{ marginBottom: 6 }}>Suggested</div>
+            &quot;The Business plan is available for just $24/user/month.&quot;
+            <div style={{ marginTop: 10, display: 'flex', gap: 8 }}>
+              <span className="fb-opt sel" style={{ cursor: 'default' }}>Accept</span>
+              <span className="fb-opt" style={{ cursor: 'default' }}>Ignore</span>
+            </div>
           </div>
         </div>
       </div></section>
       <div className="footer-note">
-        SanityGate is a free public pilot. It never rewrites your text automatically, and it distinguishes high-confidence findings from ones that need your judgment. Semantic checks run on a shared free AI capacity — during busy periods, checks may take longer or need a retry. Don&apos;t paste anything you wouldn&apos;t want processed by a third-party AI model.
+        SanityGate is a free public pilot. It never rewrites your text automatically — you decide which suggestions to accept. Semantic checks run on shared AI capacity, so during busy periods a check may take longer or come back incomplete. Don&apos;t paste anything you wouldn&apos;t want processed by a third-party AI model.
       </div>
     </div>
   );
 }
 
 function CheckScreen(props: any) {
-  const { request, setRequest, output, setOutput, checksOpen, setChecksOpen, additional, setAdditional, running, runStage, errorMsg, onRun } = props;
+  const { request, setRequest, output, setOutput, checksOpen, setChecksOpen, additional, setAdditional, running, stage, errorMsg, onRun } = props;
 
   return (
     <div className="wrap-narrow">
@@ -279,9 +306,10 @@ function CheckScreen(props: any) {
 
       <div className="check-cta">
         <button className="btn btn-primary" disabled={running} onClick={onRun}>
-          {running ? <><span className="spinner" /> {runStage || 'Checking…'}</> : 'Check with SanityGate'}
+          {running ? <><span className="spinner" /> Checking…</> : 'Check with SanityGate'}
         </button>
-        {!request.trim() && <div className="notice" style={{ maxWidth: 480 }}>No instructions or reference material provided — SanityGate will only run the additional checks you&apos;ve selected above, with nothing to check the output&apos;s content against.</div>}
+        {running && <StageProgress current={stage} />}
+        {!request.trim() && !running && <div className="notice" style={{ maxWidth: 480 }}>No instructions or reference material provided — SanityGate will only run the additional checks you&apos;ve selected above, with nothing to check the output&apos;s content against.</div>}
         {errorMsg && <div className="notice warn" style={{ maxWidth: 480 }}>{errorMsg}</div>}
         <div className="notice" style={{ maxWidth: 480, marginTop: 4 }}>
           Pilot notice: this is an experimental free tool. Don&apos;t paste anything you wouldn&apos;t want processed by a third-party AI model.
@@ -291,61 +319,61 @@ function CheckScreen(props: any) {
   );
 }
 
-function renderHighlighted(output: string, findings: Finding[], showCorrected: boolean, onClickMark: (id: string) => void) {
-  const withPos = findings.filter(f => f.start != null).sort((a, b) => a.start! - b.start!);
-  if (showCorrected) {
-    let text = output;
-    const applied = withPos.filter(f => f.status === 'applied').sort((a, b) => b.start! - a.start!);
-    for (const f of applied) text = text.slice(0, f.start!) + (f.suggestion || f.matchedText) + text.slice(f.end!);
-    return <>{text}</>;
+// ---------------------------------------------------------------------
+// Result screen
+// ---------------------------------------------------------------------
+type Decision = 'pending' | 'accepted' | 'ignored';
+
+function statusBanner(result: CheckRecord) {
+  if (result.checkStatus === 'check_incomplete') {
+    const why: Record<IncompleteReason, string> = {
+      busy: 'SanityGate is experiencing high demand right now, so part of the review could not run.',
+      timeout: 'The review took longer than expected and could not fully finish.',
+      general: 'Part of the review could not be completed.',
+    };
+    return { tone: 'incomplete', text: `The review could not be fully completed. ${why[result.incompleteReason || 'general']} You're welcome to try again.` };
   }
-  const nodes: React.ReactNode[] = [];
-  let cursor = 0;
-  withPos.forEach((f, i) => {
-    if (f.start! < cursor) return;
-    nodes.push(<span key={`t${i}`}>{output.slice(cursor, f.start!)}</span>);
-    nodes.push(
-      <mark key={f.id} className={`mk-${f.severity}`} onClick={() => onClickMark(f.id)}>
-        {output.slice(f.start!, f.end!)}
-      </mark>
-    );
-    cursor = f.end!;
-  });
-  nodes.push(<span key="tail">{output.slice(cursor)}</span>);
-  return nodes;
+  if (!result.hasReference && !result.additional.cta) {
+    return { tone: 'neutral', text: 'No instructions or reference material was provided, so SanityGate only ran the additional checks you selected.' };
+  }
+  if (result.checkStatus === 'clean') return { tone: 'clean', text: 'This looks consistent with what you asked for.' };
+  if (result.checkStatus === 'needs_review') return { tone: 'review', text: "SanityGate found some possible issues but isn't fully confident about them — worth a look." };
+  return { tone: 'attention', text: 'SanityGate found some things worth reviewing below.' };
 }
 
-interface ReviewFeedback {
-  useful?: boolean;
-  caughtReal?: string;
-  comment?: string;
-}
-
-interface ResultScreenProps {
-  result: CheckRecord;
-  showCorrected: boolean;
-  setShowCorrected: (value: boolean) => void;
-  onDismiss: (id: string) => void;
-  onApply: (id: string) => void;
-  onUndo: (id: string) => void;
-  onVerdict: (finding: Finding, verdict: 'correct' | 'false_positive') => void;
-  feedback: ReviewFeedback;
-  onFeedback: (patch: ReviewFeedback) => void;
+function ResultScreen({ result, persisted, onFindingDecision, feedback, onFeedback, onNewCheck }: {
+  result: CheckRecord; persisted: boolean;
+  onFindingDecision: (checkId: string, findingId: string, decision: 'accepted' | 'ignored' | 'undone') => void;
+  feedback: { useful?: boolean; caughtReal?: string; comment?: string };
+  onFeedback: (patch: { useful?: boolean; caughtReal?: string; comment?: string }) => void;
   onNewCheck: () => void;
-}
+}) {
+  const [decisions, setDecisions] = useState<Record<string, Decision>>({});
+  const decide = (id: string, d: Decision) => {
+    setDecisions(prev => ({ ...prev, [id]: d }));
+    onFindingDecision(result.id, id, d === 'pending' ? 'undone' : d);
+  };
 
-function ResultScreen({ result, showCorrected, setShowCorrected, onDismiss, onApply, onUndo, onVerdict, feedback, onFeedback, onNewCheck }: ResultScreenProps) {
-  const active: Finding[] = result.findings.filter((f: Finding) => f.status !== 'dismissed');
-  const high = active.filter(isHigh);
-  const review = active.filter((f: Finding) => !isHigh(f));
-  const dismissed = result.findings.filter((f: Finding) => f.status === 'dismissed');
+  const visible = result.findings.filter(f => decisions[f.id] !== 'ignored');
+  const ignoredCount = result.findings.length - visible.length;
+  const banner = statusBanner(result);
 
-  const complianceStatus = !result.hasReference && !result.additional?.cta ? 'No instructions provided' : result.semanticError ? 'Could not verify' : active.length ? 'Needs attention' : 'Followed your request';
+  const marks: MarkInput[] = visible.filter(f => f.passage).map(f => ({
+    id: f.id, start: f.passage!.start, end: f.passage!.end,
+    state: decisions[f.id] === 'accepted' ? 'accepted' : 'pending',
+    replacement: f.edit ? f.edit.replacement : (f.suggestion ?? f.passage!.text),
+    severity: f.severity,
+  }));
+  const segments = buildSegments(result.output, marks);
 
   function scrollToCard(id: string) {
     const el = document.querySelector(`[data-finding="${id}"]`);
     if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 900); }
   }
+
+  const title = result.checkStatus === 'clean' ? 'Review complete — nothing to change'
+    : result.checkStatus === 'check_incomplete' && visible.length === 0 ? 'Review incomplete'
+    : `Review complete — ${visible.length} change${visible.length === 1 ? '' : 's'} suggested`;
 
   return (
     <div className="wrap">
@@ -354,70 +382,41 @@ function ResultScreen({ result, showCorrected, setShowCorrected, onDismiss, onAp
         <div className="result-summary">
           <div className="rs-eyebrow">SanityGate Review</div>
           <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, alignItems: 'baseline' }}>
-            <h2 className="rs-title">Review complete — {active.length} change{active.length === 1 ? '' : 's'} recommended</h2>
-            <span style={{ color: 'var(--ink-faint)', fontSize: 12.5 }}>{new Date(result.createdAt).toLocaleString()} · {result.durationMs}ms · {result.wordCount} words</span>
+            <h2 className="rs-title">{title}</h2>
+            <span style={{ color: 'var(--ink-faint)', fontSize: 12.5 }}>{new Date(result.createdAt).toLocaleString()} · {result.wordCount} words</span>
           </div>
-          <div className="rs-counts">
-            <div className="rs-count high"><div className="n">{high.length}</div><div className="l">High confidence</div></div>
-            <div className="rs-count review"><div className="n">{review.length}</div><div className="l">Needs review</div></div>
-          </div>
-          <div style={{ marginTop: 14, fontSize: 13.5 }}>
-            <span style={{ display: 'block', fontSize: 11, color: 'var(--ink-faint)', textTransform: 'uppercase' }}>Did the AI do what you asked?</span>
-            <strong style={{ color: complianceStatus === 'Followed your request' ? 'var(--passed)' : complianceStatus === 'Needs attention' ? 'var(--critical)' : 'var(--ink-faint)' }}>{complianceStatus}</strong>
-          </div>
+          <div className={`status-banner ${banner.tone}`}>{banner.text}</div>
           {result.passedChecks.length > 0 && (
             <div className="rs-passed-list">{result.passedChecks.map((p: string, i: number) => <span key={i} className="rs-passed-item">✓ {p}</span>)}</div>
           )}
-          {result.semanticError && (
-            <div className="semantic-fail">
-              <div><strong>SanityGate couldn&apos;t complete the semantic review.</strong> {result.semanticError === 'rate_limited' ? 'Free AI capacity was temporarily exceeded.' : 'Only deterministic checks ran.'} Instruction-following and reference-fact checking did not run — the findings above are not a clean bill of health.</div>
-            </div>
-          )}
+          {!persisted && <div className="notice" style={{ marginTop: 10 }}>This result couldn&apos;t be saved to your history, but everything below is accurate.</div>}
         </div>
       </div>
 
       <div className="result-grid">
         <div className="output-panel">
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-            <h3 style={{ margin: 0, fontSize: 14.5 }}>Reviewed output</h3>
-            <button className="btn-quiet btn-sm" onClick={() => setShowCorrected(!showCorrected)}>{showCorrected ? 'Show original' : 'Show corrected version'}</button>
+          <h3 style={{ margin: '0 0 12px', fontSize: 14.5 }}>Reviewed output</h3>
+          <div className="output-text">
+            {segments.map((s, i) => {
+              if (s.kind === 'text') return <span key={i}>{s.text}</span>;
+              if (s.kind === 'accepted') return <span key={i} className="mk-accepted">{s.text}</span>;
+              return <mark key={i} className={`mk-${s.severity}`} onClick={() => scrollToCard(s.id)}>{s.text}</mark>;
+            })}
           </div>
-          <div className="output-text">{renderHighlighted(result.output, active, showCorrected, scrollToCard)}</div>
-          <div className="disclaimer">The original text is never changed automatically. Applied suggestions only appear in the corrected preview above.</div>
+          <div className="disclaimer">The original text is never changed automatically. Accepted suggestions update the preview above immediately — nothing is final until you copy it.</div>
         </div>
 
         <div className="findings-col">
-          {active.length === 0 && (
+          {visible.length === 0 && (
             <div className="finding-card"><div style={{ fontWeight: 700, marginBottom: 4 }}>Nothing flagged</div>
-              <p className="fc-reason">{result.semanticError ? 'Deterministic checks came back clean, but the instruction-following review did not complete — see the notice above.' : 'The output appears to follow what you asked for.'}</p></div>
+              <p className="fc-reason">{result.checkStatus === 'check_incomplete' ? 'The parts of the review that did complete came back clean — see the notice above for what could not be checked.' : 'The output appears to follow what you asked for.'}</p></div>
           )}
-          {active.map((f: Finding) => (
-            <div key={f.id} data-finding={f.id} className="finding-card">
-              <div className="fc-top">
-                <span className={`type-badge sev-${f.severity}`}>{typeLabel(f.type)}</span>
-                <span className={`conf-tag ${isHigh(f) ? 'conf-high' : 'conf-review'}`}>{isHigh(f) ? 'High confidence' : 'Needs review'}</span>
-              </div>
-              <p className="fc-reason">{f.reason}</p>
-              {f.matchedText && <div className="evidence-block"><div className="el">Generated</div><div className="ev">&quot;{f.matchedText}&quot;</div></div>}
-              {f.evidence && <div className="evidence-block"><div className="el">Your request said</div><div className="ev">&quot;{f.evidence}&quot;</div></div>}
-              {f.requirement && <div className="evidence-block"><div className="el">Requirement</div><div className="ev">{f.requirement}</div></div>}
-              {f.suggestion && (
-                <div className="suggestion-row">
-                  <span className="sv">{f.suggestion}</span>
-                  {f.status === 'applied' ? <button className="btn-quiet btn-sm" onClick={() => onUndo(f.id)}>Undo</button> :
-                    (f.start != null ? <button className="btn btn-primary btn-sm" onClick={() => onApply(f.id)}>Apply</button> : null)}
-                </div>
-              )}
-              <div className="fc-actions">
-                <button className="btn-quiet btn-sm" onClick={() => onDismiss(f.id)}>Dismiss</button>
-                {f.userVerdict == null ? (<>
-                  <button className="btn-quiet btn-sm" onClick={() => onVerdict(f, 'correct')}>Correct</button>
-                  <button className="btn-quiet btn-sm" onClick={() => onVerdict(f, 'false_positive')}>False positive</button>
-                </>) : <span className="conf-tag conf-review">You marked this: {f.userVerdict === 'correct' ? 'correct' : 'false positive'}</span>}
-              </div>
-            </div>
+          {visible.map((f, i) => (
+            <FindingCard key={f.id} finding={f} index={i + 1} total={visible.length}
+              state={decisions[f.id] === 'accepted' ? 'accepted' : 'pending'}
+              onAccept={() => decide(f.id, 'accepted')} onIgnore={() => decide(f.id, 'ignored')} onUndo={() => decide(f.id, 'pending')} />
           ))}
-          {dismissed.length > 0 && <div className="finding-card" style={{ opacity: .6 }}><div style={{ fontWeight: 700 }}>{dismissed.length} dismissed finding{dismissed.length === 1 ? '' : 's'}</div></div>}
+          {ignoredCount > 0 && <div className="finding-card ignored-summary">{ignoredCount} ignored</div>}
         </div>
       </div>
 
@@ -436,24 +435,55 @@ function ResultScreen({ result, showCorrected, setShowCorrected, onDismiss, onAp
   );
 }
 
+/** Section 11: a finding is shown as "Error i of N" with the generated passage, a suggested
+ * correction, and Accept/Ignore — never a category name, a confidence tag, or a layer name. */
+function FindingCard({ finding, index, total, state, onAccept, onIgnore, onUndo }: {
+  finding: Finding; index: number; total: number; state: Decision;
+  onAccept: () => void; onIgnore: () => void; onUndo: () => void;
+}) {
+  const generated = finding.passage ? finding.passage.text : null;
+  const suggested = finding.edit ? finding.edit.replacement : finding.suggestion;
+  return (
+    <div data-finding={finding.id} className={`finding-card ${state === 'accepted' ? 'fc-accepted' : ''}`}>
+      <div className="fc-index">Error {index} of {total}</div>
+      <p className="fc-reason">{finding.reason}</p>
+      {finding.requirementQuote && <div className="evidence-block"><div className="el">From your request</div><div className="ev">{finding.requirementQuote}</div></div>}
+      {generated !== null && <div className="evidence-block"><div className="el">Generated</div><div className="ev">{generated || '(nothing)'}</div></div>}
+      {suggested != null && (
+        <div className="evidence-block sv-block"><div className="el">Suggested</div><div className="ev">{suggested === '' ? '(remove this)' : suggested}</div></div>
+      )}
+      <div className="fc-actions">
+        {state === 'accepted'
+          ? <button className="btn-quiet btn-sm" onClick={onUndo}>Undo</button>
+          : (<><button className="btn btn-primary btn-sm" onClick={onAccept}>Accept</button><button className="btn-quiet btn-sm" onClick={onIgnore}>Ignore</button></>)}
+      </div>
+    </div>
+  );
+}
+
 function HistoryScreen({ history, onOpen, onRunFirst }: { history: CheckRecord[] | null; onOpen: (r: CheckRecord) => void; onRunFirst: () => void }) {
   if (history === null) return <div className="wrap"><div style={{ padding: '40px 0', textAlign: 'center', color: 'var(--ink-soft)' }}><span className="spinner dark" /> Loading history…</div></div>;
   if (history.length === 0) {
     return <div className="wrap"><div className="empty-state"><h3>No checks yet</h3><p>Run your first check and it&apos;ll show up here.</p>
       <div style={{ marginTop: 14 }}><button className="btn btn-primary" onClick={onRunFirst}>Run a check</button></div></div></div>;
   }
+  const badge = (h: CheckRecord) => {
+    if (h.checkStatus === 'check_incomplete') return { text: 'incomplete', cls: 'badge-neutral' };
+    if (h.checkStatus === 'clean') return { text: 'clean', cls: 'badge-clean' };
+    if (h.checkStatus === 'needs_review') return { text: 'needs a look', cls: 'badge-neutral' };
+    return { text: `${h.findings.length} found`, cls: 'badge-attention' };
+  };
   return (
     <div className="wrap">
       <div className="check-head"><h1>History</h1><p>Checks from this browser (matched by an anonymous local id, not an account).</p></div>
       <div className="hist-list">
         {history.map(h => {
-          const active = h.findings.filter(f => f.status !== 'dismissed');
-          const high = active.filter(isHigh).length;
+          const b = badge(h);
           return (
             <div key={h.id} className="hist-item" onClick={() => onOpen(h)}>
               <div><div className="hist-title">{(h.output || '').trim().split('\n')[0].slice(0, 60) || 'Untitled check'}</div>
-                <div className="hist-meta">{new Date(h.createdAt).toLocaleString()} · {active.length} issue{active.length === 1 ? '' : 's'}</div></div>
-              <span className="type-badge" style={{ background: high > 0 ? 'var(--critical-soft)' : 'var(--passed-soft)', color: high > 0 ? 'var(--critical)' : 'var(--passed)' }}>{high > 0 ? `${high} high` : 'clean'}</span>
+                <div className="hist-meta">{new Date(h.createdAt).toLocaleString()}</div></div>
+              <span className={`type-badge ${b.cls}`}>{b.text}</span>
             </div>
           );
         })}

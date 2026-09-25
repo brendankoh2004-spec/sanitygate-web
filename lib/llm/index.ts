@@ -1,39 +1,24 @@
 import { LLMProvider, LLMRole } from './provider';
 import { OpenRouterProvider } from './openrouter';
 
-const cache = new Map<string, LLMProvider>();
-
 /**
- * Returns the configured LLMProvider for a given pipeline stage.
- * EVALUATOR_MODEL and VERIFIER_MODEL can be set independently (spec
- * section 24), so we can later test whether e.g. a stronger verifier
- * model reduces false positives without changing the evaluator. Both
- * fall back to OPENROUTER_MODEL if unset. Extraction shares the
- * evaluator's model unless EXTRACTION_MODEL is set explicitly.
- *
- * To add a new provider (Gemini, Anthropic, OpenAI...), implement
- * LLMProvider in lib/llm/<name>.ts and extend the switch below —
- * nothing in lib/pipeline.ts needs to change.
+ * Model selection is intentionally minimal:
+ *   OPENROUTER_MODEL  (optional) — passed through as an opaque string; defaults to the OpenRouter router.
+ *   EVALUATOR_MODEL / VERIFIER_MODEL / EXTRACTION_MODEL (optional) — per-stage overrides.
+ *     Pointing VERIFIER_MODEL at a different model than EVALUATOR_MODEL is the
+ *     cheapest way to reduce correlated errors, but nothing requires it.
+ * Nothing in the pipeline depends on a particular model behaving perfectly:
+ * every response is validated, retried once where sensible, and any residual
+ * failure surfaces as an "incomplete" review, never as "clean".
  */
 export function getProvider(role: LLMRole = 'evaluator'): LLMProvider {
-  const key = `${role}:${process.env.LLM_PROVIDER || 'openrouter'}`;
-  const cached = cache.get(key);
-  if (cached) return cached;
-
-  const providerName = process.env.LLM_PROVIDER || 'openrouter';
-  const modelEnvVar = { extraction: 'EXTRACTION_MODEL', evaluator: 'EVALUATOR_MODEL', verifier: 'VERIFIER_MODEL' }[role];
-  const modelOverride = process.env[modelEnvVar] || (role === 'extraction' ? process.env.EVALUATOR_MODEL : undefined);
-
-  let provider: LLMProvider;
-  switch (providerName) {
-    case 'openrouter':
-      provider = new OpenRouterProvider(modelOverride);
-      break;
-    default:
-      throw new Error(`Unknown LLM_PROVIDER "${providerName}". Supported: openrouter.`);
+  const name = process.env.LLM_PROVIDER || 'openrouter';
+  const envVar = { extraction: 'EXTRACTION_MODEL', evaluator: 'EVALUATOR_MODEL', verifier: 'VERIFIER_MODEL' }[role];
+  const override = process.env[envVar] || (role === 'extraction' ? process.env.EVALUATOR_MODEL : undefined);
+  switch (name) {
+    case 'openrouter': return new OpenRouterProvider(override);
+    default: throw new Error(`Unknown LLM_PROVIDER "${name}". Supported: openrouter.`);
   }
-  cache.set(key, provider);
-  return provider;
 }
 
 export * from './provider';

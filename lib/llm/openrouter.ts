@@ -1,20 +1,10 @@
-import { LLMProvider, LLMJsonOptions, LLMError } from './provider';
+import { LLMProvider, LLMJsonOptions, LLMJsonResult, LLMError } from './provider';
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
-/**
- * OpenRouter provider. Uses whatever model is configured in
- * OPENROUTER_MODEL (default: a free model — verify current availability
- * at https://openrouter.ai/models?max_price=0 before deploying, since
- * OpenRouter's free-model lineup changes over time and free models are
- * rate-limited per OpenRouter account, not unlimited).
- *
- * We do not rely on OpenRouter's structured-output / JSON-mode support
- * because not all free models honor `response_format`. Instead the
- * caller's prompt explicitly demands JSON-only output, and this class
- * does best-effort extraction + parsing, throwing LLMError('invalid_response')
- * if the model's output cannot be parsed as JSON at all.
- */
+/** Whatever model/router is configured is passed through as an opaque string. No model-specific logic lives in the pipeline. */
+export const DEFAULT_MODEL = 'openrouter/free';
+
 export class OpenRouterProvider implements LLMProvider {
   readonly name = 'openrouter';
   readonly model: string;
@@ -24,200 +14,162 @@ export class OpenRouterProvider implements LLMProvider {
 
   constructor(modelOverride?: string) {
     const key = process.env.OPENROUTER_API_KEY;
-    if (!key) {
-      throw new Error('OPENROUTER_API_KEY is not set. See .env.example.');
-    }
+    if (!key) throw new Error('OPENROUTER_API_KEY is not set. See .env.example.');
     this.apiKey = key;
-    this.model = modelOverride || process.env.OPENROUTER_MODEL || 'meta-llama/llama-3.1-8b-instruct:free';
+    this.model = (modelOverride || process.env.OPENROUTER_MODEL || DEFAULT_MODEL).trim();
     this.siteUrl = process.env.OPENROUTER_SITE_URL || 'http://localhost:3000';
     this.siteName = process.env.OPENROUTER_SITE_NAME || 'SanityGate';
   }
 
-  async completeJSON<T = unknown>(prompt: string, opts: LLMJsonOptions = {}): Promise<T> {
+  async completeJSON<T = unknown>(prompt: string, opts: LLMJsonOptions = {}): Promise<LLMJsonResult<T>> {
     const stage = opts.stage || 'llm';
+    const timeoutMs = opts.timeoutMs ?? 30000;
     const callStart = Date.now();
-    // Start-of-call marker with no prompt/document content — this is what
-    // lets production logs answer "did call N even start" independently
-    // of whether it later failed. Previously only failure paths logged
-    // anything, so a successful-but-slow call was invisible until it
-    // either finished (silently) or the whole request's duration was
-    // inspected after the fact.
-    console.error(`[sanitygate:${stage}] calling model=${this.model} timeoutMs=${opts.timeoutMs ?? 30000}`);
+    console.error(`[sanitygate:${stage}] calling model=${this.model} timeoutMs=${timeoutMs}`);
+
+    // One controller covers headers AND body: a stalled body read must not outlive the stage budget.
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), opts.timeoutMs ?? 30000);
-
-    let res: Response;
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      res = await fetch(OPENROUTER_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.apiKey}`,
-          'HTTP-Referer': this.siteUrl,
-          'X-Title': this.siteName,
-        },
-        body: JSON.stringify({
-          model: this.model,
-          temperature: opts.temperature ?? 0.1,
-          max_tokens: opts.maxTokens ?? 1200,
-          // Best-effort mitigation for reasoning-capable models: some free
-          // OpenRouter models spend hidden "thinking" tokens against the
-          // same max_tokens budget before ever emitting visible content,
-          // which can exhaust the budget and return finish_reason="length"
-          // with an EMPTY message.content — a strong signature we've seen
-          // in production. OpenRouter's reasoning-control API lets a
-          // request opt out of this for models that support it; models/
-          // providers that don't recognize the field simply ignore it, so
-          // this is safe to send unconditionally. Not verified against a
-          // live call in this environment — treat as best-effort, not
-          // confirmed, until tested with a real API key.
-          reasoning: { exclude: true },
-          messages: [
-            {
-              role: 'user',
-              content: prompt + '\n\nRespond with ONLY the JSON object/array described above. No markdown fences, no commentary, no prose before or after the JSON.',
-            },
-          ],
-        }),
-        signal: controller.signal,
-      });
-    } catch (e: any) {
-      clearTimeout(timeout);
-      if (e.name === 'AbortError') {
-        console.error(`[sanitygate:${stage}] timeout after ${opts.timeoutMs ?? 30000}ms (model=${this.model})`);
-        throw new LLMError('timeout', 'OpenRouter request timed out.');
+      let attempt = await this.post(prompt, opts, controller.signal, true);
+      // Some models/providers reject the optional `reasoning` field. Retry once without it.
+      if ([400, 404, 422].includes(attempt.status)) {
+        console.error(`[sanitygate:${stage}] HTTP ${attempt.status} with reasoning option; retrying once without it (model=${this.model})`);
+        attempt = await this.post(prompt, opts, controller.signal, false);
       }
-      console.error(`[sanitygate:${stage}] network error (model=${this.model}): ${e.message}`);
-      throw new LLMError('upstream_error', `OpenRouter request failed: ${e.message}`);
+      return this.interpret<T>(attempt, stage, opts, callStart);
+    } catch (e: any) {
+      if (e instanceof LLMError) throw e;
+      if (e?.name === 'AbortError') {
+        console.error(`[sanitygate:${stage}] timeout after ${timeoutMs}ms (model=${this.model})`);
+        throw new LLMError('timeout', 'Model request timed out.');
+      }
+      console.error(`[sanitygate:${stage}] network error (model=${this.model}): ${e?.message}`);
+      throw new LLMError('upstream_error', `Model request failed: ${e?.message}`);
+    } finally {
+      clearTimeout(timer);
     }
-    clearTimeout(timeout);
+  }
 
-    if (res.status === 429) {
-      console.error(`[sanitygate:${stage}] rate limited by OpenRouter (model=${this.model})`);
-      throw new LLMError('rate_limited', 'OpenRouter free-tier rate limit reached.');
+  private async post(prompt: string, opts: LLMJsonOptions, signal: AbortSignal, withReasoning: boolean): Promise<{ status: number; text: string }> {
+    const body: Record<string, unknown> = {
+      model: this.model,
+      temperature: opts.temperature ?? 0.1,
+      max_tokens: opts.maxTokens ?? 1200,
+      messages: [{
+        role: 'user',
+        content: prompt + '\n\nRespond with ONLY the JSON object described above. No markdown fences, no commentary before or after.',
+      }],
+    };
+    if (withReasoning) body.reasoning = { exclude: true };   // best-effort; not verified against a live call
+    const res = await fetch(OPENROUTER_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.apiKey}`,
+        'HTTP-Referer': this.siteUrl,
+        'X-Title': this.siteName,
+      },
+      body: JSON.stringify(body),
+      signal,
+    });
+    const text = await res.text();   // inside the abort scope
+    return { status: res.status, text };
+  }
+
+  private interpret<T>(r: { status: number; text: string }, stage: string, opts: LLMJsonOptions, callStart: number): LLMJsonResult<T> {
+    if (r.status === 429) {
+      console.error(`[sanitygate:${stage}] rate limited (model=${this.model})`);
+      throw new LLMError('rate_limited', 'Rate limit reached.');
     }
-    if (!res.ok) {
-      const body = await safeText(res);
-      console.error(`[sanitygate:${stage}] upstream HTTP ${res.status} (model=${this.model}): ${body.slice(0, 300)}`);
-      throw new LLMError('upstream_error', `OpenRouter returned ${res.status}: ${body.slice(0, 300)}`);
+    if (r.status < 200 || r.status >= 300) {
+      console.error(`[sanitygate:${stage}] upstream HTTP ${r.status} (model=${this.model}): ${r.text.slice(0, 300)}`);
+      throw new LLMError('upstream_error', `Upstream returned ${r.status}`);
+    }
+    let data: any = null;
+    try { data = JSON.parse(r.text); } catch { /* handled below */ }
+
+    // OpenRouter can return HTTP 200 with an error object in the body.
+    if (data?.error && !data?.choices?.length) {
+      const code = Number(data.error.code);
+      console.error(`[sanitygate:${stage}] provider error in 200 body code=${data.error.code} (model=${this.model}): ${String(data.error.message || '').slice(0, 200)}`);
+      throw new LLMError(code === 429 ? 'rate_limited' : 'upstream_error', 'Provider reported an error.');
     }
 
-    const data = await res.json().catch(() => null);
     const choice = data?.choices?.[0];
-    const content: string | undefined = choice?.message?.content;
-    const finishReason: string | undefined = choice?.finish_reason;
-    if (!content) {
-      console.error(`[sanitygate:${stage}] empty response body (model=${this.model}, finish_reason=${finishReason ?? 'unknown'})`);
-      throw new LLMError('invalid_response', 'OpenRouter response had no message content.');
+    const content: unknown = choice?.message?.content;
+    const finishReason: string = choice?.finish_reason ?? 'unknown';
+    if (typeof content !== 'string' || !content.trim()) {
+      console.error(`[sanitygate:${stage}] empty response body (model=${this.model}, finish_reason=${finishReason})`);
+      throw new LLMError('invalid_response', 'Model returned no content.');
     }
-    if (finishReason === 'length') {
-      // Diagnostic only, not fatal on its own — extractJson's salvage
-      // path may still recover a usable partial result from this.
-      console.error(`[sanitygate:${stage}] response hit max_tokens and was truncated by the model (model=${this.model}, maxTokens=${opts.maxTokens ?? 1200}, contentLength=${content.length})`);
-    }
-
     const parsed = extractJson(content);
     if (parsed === null) {
-      console.error(`[sanitygate:${stage}] could not parse JSON from model output, even with salvage (model=${this.model}, finish_reason=${finishReason ?? 'unknown'}, contentLength=${content.length})`);
+      console.error(`[sanitygate:${stage}] unparseable output (model=${this.model}, finish_reason=${finishReason}, len=${content.length})`);
       throw new LLMError('invalid_response', 'Could not parse JSON from model output.');
     }
-    if (parsed.salvaged) {
-      console.error(`[sanitygate:${stage}] recovered a partial result from a truncated/malformed response (model=${this.model}, finish_reason=${finishReason ?? 'unknown'})`);
-    }
-    console.error(`[sanitygate:${stage}] completed in ${Date.now() - callStart}ms (model=${this.model}, finish_reason=${finishReason ?? 'unknown'}, contentLength=${content.length})`);
-    return parsed.value as T;
+    const partial = parsed.salvaged || (finishReason === 'length' && !parsed.exact);
+    if (partial) console.error(`[sanitygate:${stage}] partial result recovered (model=${this.model}, finish_reason=${finishReason})`);
+    console.error(`[sanitygate:${stage}] completed in ${Date.now() - callStart}ms (model=${this.model}, finish_reason=${finishReason}, len=${content.length})`);
+    return { value: parsed.value as T, partial };
   }
-}
-
-async function safeText(res: Response): Promise<string> {
-  try { return await res.text(); } catch { return ''; }
 }
 
 export interface JsonExtractionResult {
   value: unknown;
-  /** true if the strict parse failed and we recovered a partial result
-   * by scanning for complete objects inside a truncated/malformed
-   * response — callers should treat this as a signal worth logging
-   * (it means the model's output was cut off or malformed), even though
-   * the recovered data itself is usable. */
-  salvaged: boolean;
+  salvaged: boolean;   // strict parse failed; a repaired prefix was recovered
+  exact: boolean;      // strict parse of the full text/span succeeded
 }
 
-/** Best-effort JSON extraction: strips markdown fences, then tries the
- * whole string, then the widest {...} or [...] span, then — if the
- * response was truncated mid-way (very common on free/small models when
- * max_tokens runs out before a long list of findings is fully written) —
- * salvages whichever complete {...} objects appear before the cutoff
- * rather than discarding the entire response over one incomplete
- * trailing object. */
+/**
+ * Best-effort JSON extraction. Order: strict parse -> widest {...}/[...] span ->
+ * truncation repair (keep every COMPLETE nested value up to the cutoff and
+ * close the open brackets). Repair is generic, so it works for every response
+ * shape in this app (requirements, judgments, verdicts, findings).
+ */
 export function extractJson(raw: string): JsonExtractionResult | null {
-  let text = raw.trim();
-  text = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+  let text = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
 
-  try { return { value: JSON.parse(text), salvaged: false }; } catch { /* fall through */ }
+  try { return { value: JSON.parse(text), salvaged: false, exact: true }; } catch { /* next */ }
 
-  const firstObj = text.indexOf('{');
-  const lastObj = text.lastIndexOf('}');
-  if (firstObj >= 0 && lastObj > firstObj) {
-    try { return { value: JSON.parse(text.slice(firstObj, lastObj + 1)), salvaged: false }; } catch { /* fall through */ }
+  const o1 = text.indexOf('{'), o2 = text.lastIndexOf('}');
+  if (o1 >= 0 && o2 > o1) {
+    try { return { value: JSON.parse(text.slice(o1, o2 + 1)), salvaged: false, exact: true }; } catch { /* next */ }
   }
-  const firstArr = text.indexOf('[');
-  const lastArr = text.lastIndexOf(']');
-  if (firstArr >= 0 && lastArr > firstArr) {
-    try { return { value: JSON.parse(text.slice(firstArr, lastArr + 1)), salvaged: false }; } catch { /* fall through */ }
+  const a1 = text.indexOf('['), a2 = text.lastIndexOf(']');
+  if (a1 >= 0 && a2 > a1 && (o1 < 0 || a1 < o1)) {
+    try { return { value: JSON.parse(text.slice(a1, a2 + 1)), salvaged: false, exact: true }; } catch { /* next */ }
   }
 
-  // Salvage path: the response is truncated or otherwise malformed as a
-  // whole. If it looks like {"issues": [ {...}, {...}, <cut off> ]}, keep
-  // every complete object up to the cutoff. If it looks like a bare
-  // array (the verifier's shape), do the same directly.
-  const issuesKeyIdx = text.indexOf('"issues"');
-  if (issuesKeyIdx >= 0) {
-    const arrIdx = text.indexOf('[', issuesKeyIdx);
-    if (arrIdx >= 0) {
-      const objs = salvageObjectArray(text, arrIdx);
-      if (objs && objs.length) return { value: { issues: objs }, salvaged: true };
-    }
-  }
-  const bareArrIdx = text.indexOf('[');
-  if (bareArrIdx >= 0) {
-    const objs = salvageObjectArray(text, bareArrIdx);
-    if (objs && objs.length) return { value: objs, salvaged: true };
-  }
-
-  return null;
+  const start = o1 >= 0 && (a1 < 0 || o1 < a1) ? o1 : a1;
+  if (start < 0) return null;
+  const repaired = repairTruncated(text.slice(start));
+  if (repaired === null) return null;
+  return { value: repaired, salvaged: true, exact: false };
 }
 
-/** Scans a JSON array starting at `arrayStart` (the index of '[') and
- * returns every syntactically-complete top-level {...} object found
- * before the array either closes normally or truncates mid-object.
- * String literals (including escaped quotes/braces inside them) are
- * tracked so brace-counting doesn't get confused by braces that appear
- * inside a quoted "explanation" or "reason" field. */
-function salvageObjectArray(text: string, arrayStart: number): any[] | null {
-  const objs: any[] = [];
-  let i = arrayStart + 1;
-  while (i < text.length) {
-    while (i < text.length && /[\s,]/.test(text[i])) i++;
-    if (i >= text.length || text[i] === ']') break;
-    if (text[i] !== '{') break;
-
-    let depth = 0, inStr = false, esc = false, j = i;
-    for (; j < text.length; j++) {
-      const ch = text[j];
-      if (inStr) {
-        if (esc) esc = false;
-        else if (ch === '\\') esc = true;
-        else if (ch === '"') inStr = false;
-      } else {
-        if (ch === '"') inStr = true;
-        else if (ch === '{') depth++;
-        else if (ch === '}') { depth--; if (depth === 0) { j++; break; } }
-      }
+function repairTruncated(text: string): unknown | null {
+  const stack: string[] = [];
+  let inStr = false, esc = false;
+  let safeIdx = -1;
+  let safeStack: string[] = [];
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
     }
-    if (depth !== 0) break; // truncated mid-object — stop, discard the incomplete tail
-    try { objs.push(JSON.parse(text.slice(i, j))); } catch { /* skip a malformed individual object, keep scanning is unsafe once one fails to parse cleanly */ break; }
-    i = j;
+    if (ch === '"') inStr = true;
+    else if (ch === '{' || ch === '[') stack.push(ch);
+    else if (ch === '}' || ch === ']') {
+      stack.pop();
+      safeIdx = i + 1;
+      safeStack = [...stack];
+    }
   }
-  return objs.length ? objs : null;
+  if (safeIdx < 0 || safeStack.length === 0) return null;   // nothing complete and nested to keep
+  const closers = safeStack.reverse().map(c => (c === '{' ? '}' : ']')).join('');
+  try { return JSON.parse(text.slice(0, safeIdx) + closers); } catch { return null; }
 }

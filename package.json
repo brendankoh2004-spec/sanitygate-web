@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "next lint",
     "test:unit": "tsx test/run_all.ts",
-    "eval": "tsx evaluation/run_eval.ts"
+    "eval": "tsx evaluation/run_eval.ts",
+    "eval:q3-live": "tsx evaluation/run_q3_live.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.4",

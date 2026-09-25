@@ -188,7 +188,8 @@ IMPORTANT:
 - Do not flag paraphrases, equivalent wording, formatting differences unless formatting is explicitly required, or harmless omissions.
 - Do not flag style or tone.
 - An empty findings list is valid.
-- Report at most 8 material findings.
+- Report at most 5 MATERIAL findings.
+- Do not report minor or overlapping issues.
 - Prioritise the clearest and most material findings.
 - Every finding must explain why it is not merely a paraphrase or equivalent representation.
 - For number/date/name issues, explain what each side refers to.

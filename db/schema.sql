@@ -35,7 +35,7 @@ create table if not exists checks (
   request text not null default '',          -- "what did you ask the AI to do?" box (prompt/instructions/reference, all together)
   output text not null,
   additional jsonb not null default '{}'::jsonb,          -- AdditionalChecks (cta/bullets/numbered/required-terms/forbidden-terms/word-count)
-  extracted_requirements jsonb not null default '[]'::jsonb, -- structured output of the requirement-extraction step, kept for auditability
+  extracted_requirements jsonb not null default '[]'::jsonb, -- DEPRECATED: written by the retired extraction pipeline. No longer written or read; kept only so historical ledgers are not destroyed (see db/migrations/0004).
   findings jsonb not null default '[]'::jsonb,
   passed_checks jsonb not null default '[]'::jsonb,
   word_count int not null default 0,
@@ -43,7 +43,7 @@ create table if not exists checks (
   semantic_error text,
   has_reference boolean not null default false,
   check_status text not null default 'clean',  -- 'clean'|'findings'|'needs_review'|'check_incomplete' — see lib/types.ts CheckStatus. A failed/incomplete semantic check must never be indistinguishable from a genuinely clean one.
-  diagnostics jsonb not null default '{}'::jsonb  -- internal only: per-stage outcomes (ok/code/attempts/ms/model), notes and counters. NEVER selected by app/api/history (see its explicit column list) — for engineers debugging via Supabase directly, not for the browser.
+  diagnostics jsonb not null default '{}'::jsonb  -- internal only: per-stage outcomes (direct/coverage/reverse/adjudicator: ok/code/attempts/ms/model/prompt size/max tokens/timeout), notes and counters. NEVER selected by app/api/history (see its explicit column list) — for engineers debugging via Supabase directly, not for the browser.
 );
 create index if not exists checks_session_idx on checks (session_id, created_at desc);
 create index if not exists checks_created_idx on checks (created_at desc);
@@ -88,15 +88,18 @@ begin
 end;
 $$;
 
--- One row per golden-dataset run, so we can detect regressions when the
--- evaluator prompt or validators change. See evaluation/run_eval.ts and
--- app/api/admin/eval/route.ts.
+-- One row per golden-dataset run, so we can detect regressions when a
+-- reviewer/adjudicator prompt or validator changes. See evaluation/run_eval.ts and
+-- app/api/admin/eval/route.ts. evaluator_model / verifier_model / extraction_model
+-- belong to the retired architecture: nullable, kept only for historical rows.
 create table if not exists eval_runs (
   id uuid primary key default gen_random_uuid(),
   created_at timestamptz not null default now(),
-  evaluator_model text not null,
-  verifier_model text not null,
-  extraction_model text not null,
+  reviewer_model text,          -- "direct=... coverage=... reverse=..."
+  adjudicator_model text,
+  evaluator_model text,
+  verifier_model text,
+  extraction_model text,
   total_cases int not null,
   true_positives int not null,
   false_positives int not null,
@@ -107,7 +110,6 @@ create table if not exists eval_runs (
   false_positive_rate numeric,
   evidence_accuracy numeric,
   suggestion_grounding_accuracy numeric,
-  requirement_extraction_accuracy numeric,
   details jsonb not null default '[]'::jsonb
 );
 

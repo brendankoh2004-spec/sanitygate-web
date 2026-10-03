@@ -1,4 +1,4 @@
-import { findSpan, splitSentences, sameLocation } from '../lib/evidence';
+import { findSpan, spanOverlap } from '../lib/evidence';
 import { applyEdits, editsConflict, canAccept, buildSegments } from '../lib/edits';
 import { TextEdit } from '../lib/types';
 import { check, done } from './helpers';
@@ -20,13 +20,8 @@ import { check, done } from './helpers';
   check('findSpan: mapped span excludes surrounding whitespace', m.found && 'x  hello\n\nworld  y'.slice(m.start!, m.end!) === 'hello\n\nworld');
 }
 
-// ---- sentence splitting ---------------------------------------------------
-{
-  const t = 'Revenue was S$8.42 million. Margin rose 2.5 points! Is it?\nNew line here.';
-  const s = splitSentences(t).map(x => t.slice(x.start, x.end));
-  check('splitSentences: decimals do not split; ends/newlines do', s.length === 4 && s[0] === 'Revenue was S$8.42 million.' && s[1] === 'Margin rose 2.5 points!' && s[3] === 'New line here.', JSON.stringify(s));
-  check('sameLocation: overlap >= 50% of shorter span', sameLocation({ start: 0, end: 10 }, { start: 5, end: 30 }) && !sameLocation({ start: 0, end: 10 }, { start: 9, end: 30 }));
-}
+// ---- span overlap (used to require a fix to touch the flagged passage) ----
+check('spanOverlap: counts shared characters, zero when disjoint or merely adjacent', spanOverlap({ start: 0, end: 10 }, { start: 5, end: 30 }) === 5 && spanOverlap({ start: 0, end: 10 }, { start: 10, end: 30 }) === 0);
 
 // ---- edits: targeted, original-offset, order independent ------------------
 const ORIGINAL = 'Revenue was S$3.54 million. Launch on December 15, 2026. Unlike RivalCorp, we grew.';

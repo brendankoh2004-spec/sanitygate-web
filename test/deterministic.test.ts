@@ -13,7 +13,7 @@ const DIR = path.dirname(fileURLToPath(import.meta.url));
   const text = Array.from({ length: 60 }, (_, i) => `w${i}`).join(' ');
   check('word count: counts whitespace-delimited words', countWords(text) === 60 && countWords('  ') === 0 && countWords('a\nb\tc') === 3);
   let r = runDeterministic(text, adv({ maxWords: true, maxWordsVal: 50 }));
-  check('max words: 60 > 50 -> one finding, structural, no passage', r.findings.length === 1 && r.findings[0].category === 'structural' && r.findings[0].passage === null && /10 words over/.test(r.findings[0].reason), JSON.stringify(r.findings));
+  check('max words: 60 > 50 -> one finding, structural, no passage', r.findings.length === 1 && r.findings[0].category === 'structural' && r.findings[0].passage === null && /10 over the 50-word limit/.test(r.findings[0].reason), JSON.stringify(r.findings));
   r = runDeterministic(text, adv({ maxWords: true, maxWordsVal: 60 }));
   check('max words: exactly at limit passes (boundary)', r.findings.length === 0 && r.passed.some(p => /60-word limit/.test(p)));
   r = runDeterministic(text, adv({ minWords: true, minWordsVal: 61 }));

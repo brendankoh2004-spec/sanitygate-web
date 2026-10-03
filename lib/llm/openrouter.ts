@@ -31,41 +31,12 @@ export class OpenRouterProvider implements LLMProvider {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      let attempt = await this.post(
-        prompt,
-        opts,
-        controller.signal,
-        true,
-      );
-      
-      // Some providers/models reject the optional reasoning field.
-      // Only retry when the provider error specifically indicates that
-      // the reasoning parameter is unsupported.
-      if (
-        [400, 404, 422].includes(attempt.status) &&
-        reasoningOptionRejected(attempt.text)
-      ) {
-        console.error(
-          `[sanitygate:${stage}] HTTP ${attempt.status} indicates unsupported reasoning option; ` +
-          `retrying once without it (model=${this.model})`,
-        );
-      
-        attempt = await this.post(
-          prompt,
-          opts,
-          controller.signal,
-          false,
-        );
+      let attempt = await this.post(prompt, opts, controller.signal, true);
+      // Some models/providers reject the optional `reasoning` field. Retry once without it.
+      if ([400, 404, 422].includes(attempt.status)) {
+        console.error(`[sanitygate:${stage}] HTTP ${attempt.status} with reasoning option; retrying once without it (model=${this.model})`);
+        attempt = await this.post(prompt, opts, controller.signal, false);
       }
-      
-
-      
-      
-      
-      
-      
-      
-      
       return this.interpret<T>(attempt, stage, opts, callStart);
     } catch (e: any) {
       if (e instanceof LLMError) throw e;
@@ -144,24 +115,6 @@ export class OpenRouterProvider implements LLMProvider {
   }
 }
 
-function reasoningOptionRejected(text: string): boolean {
-  const t = text.toLowerCase();
-
-  return (
-    t.includes('reasoning') &&
-    (
-      t.includes('unsupported') ||
-      t.includes('unknown parameter') ||
-      t.includes('unrecognized parameter') ||
-      t.includes('invalid parameter') ||
-      t.includes('not allowed') ||
-      t.includes('unexpected field')
-    )
-  );
-}
-
-
-
 export interface JsonExtractionResult {
   value: unknown;
   salvaged: boolean;   // strict parse failed; a repaired prefix was recovered
@@ -172,7 +125,7 @@ export interface JsonExtractionResult {
  * Best-effort JSON extraction. Order: strict parse -> widest {...}/[...] span ->
  * truncation repair (keep every COMPLETE nested value up to the cutoff and
  * close the open brackets). Repair is generic, so it works for every response
- * shape in this app (requirements, judgments, verdicts, findings).
+ * shape in this app (reviewer issues, adjudicator decisions).
  */
 export function extractJson(raw: string): JsonExtractionResult | null {
   let text = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();

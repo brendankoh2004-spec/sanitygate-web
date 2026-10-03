@@ -8,13 +8,13 @@
  * If evaluation/results/baseline.json exists, compares against it and
  * exits with code 1 if recall drops or the false-positive rate rises
  * by more than the thresholds below — wire this into CI so a change to
- * the evaluator/verifier/extraction prompts or a validator can't
- * silently make the checker worse ("test the tester", spec section 29/30).
+ * a reviewer/adjudicator prompt or a validator can't silently make the
+ * checker worse ("test the tester", spec section 29/30).
  */
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { GoldenCase, runGoldenCase, summarize, GradedCase } from './metrics';
+import { GoldenCase, runGoldenCase, summarize, describeModels, GradedCase } from './metrics';
 import { getProvider } from '../lib/llm';
 import { Providers } from '../lib/pipeline';
 
@@ -40,7 +40,7 @@ async function main() {
 
   let providers: Providers;
   try {
-    providers = { extraction: getProvider('extraction'), evaluator: getProvider('evaluator'), verifier: getProvider('verifier') };
+    providers = { direct: getProvider('direct'), coverage: getProvider('coverage'), reverse: getProvider('reverse'), adjudicator: getProvider('adjudicator') };
   } catch (e: any) {
     console.error('Cannot run evaluation: LLM provider not configured.');
     console.error(e.message);
@@ -52,9 +52,11 @@ async function main() {
   const casesPath = path.join(ROOT, 'evaluation', 'golden_cases.json');
   const cases: GoldenCase[] = JSON.parse(fs.readFileSync(casesPath, 'utf8'));
   console.log(`Loaded ${cases.length} golden cases.`);
-  console.log(`Evaluator model:  ${providers.evaluator!.name}:${providers.evaluator!.model}`);
-  console.log(`Verifier model:   ${providers.verifier!.name}:${providers.verifier!.model}`);
-  console.log(`Extraction model: ${providers.extraction!.name}:${providers.extraction!.model}\n`);
+  const models = describeModels(providers);
+  console.log(`Direct model:      ${models.direct}`);
+  console.log(`Coverage model:    ${models.coverage}`);
+  console.log(`Reverse model:     ${models.reverse}`);
+  console.log(`Adjudicator model: ${models.adjudicator}\n`);
 
   const graded: GradedCase[] = [];
   for (const c of cases) {
@@ -65,7 +67,7 @@ async function main() {
       console.log(`${g.classification}${g.semanticError ? ' [semantic error: ' + g.semanticError + ']' : ''}`);
     } catch (e: any) {
       console.log(`ERROR: ${e.message}`);
-      graded.push({ id: c.id, category: c.category, classification: 'FN', matched: [], evidenceOk: null, suggestionOk: null, extractionOk: null, semanticError: 'exception', durationMs: 0 });
+      graded.push({ id: c.id, category: c.category, classification: 'FN', matched: [], evidenceOk: null, suggestionOk: null, semanticError: 'exception', durationMs: 0 });
     }
   }
 
@@ -81,7 +83,6 @@ async function main() {
   console.log(`False positive rate:            ${summary.falsePositiveRate}`);
   console.log(`Evidence accuracy:              ${summary.evidenceAccuracy}`);
   console.log(`Suggestion grounding accuracy:  ${summary.suggestionGroundingAccuracy}`);
-  console.log(`Requirement extraction accuracy:${summary.requirementExtractionAccuracy}`);
   console.log(`Semantic call failures:         ${summary.semanticFailures}`);
   console.log('\nBy category:');
   for (const [cat, c] of Object.entries(summary.byCategory)) {
@@ -93,9 +94,7 @@ async function main() {
   const runFile = path.join(resultsDir, `run-${Date.now()}.json`);
   const payload = {
     createdAt: new Date().toISOString(),
-    evaluatorModel: `${providers.evaluator!.name}:${providers.evaluator!.model}`,
-    verifierModel: `${providers.verifier!.name}:${providers.verifier!.model}`,
-    extractionModel: `${providers.extraction!.name}:${providers.extraction!.model}`,
+    models,
     summary, graded,
   };
   fs.writeFileSync(runFile, JSON.stringify(payload, null, 2));

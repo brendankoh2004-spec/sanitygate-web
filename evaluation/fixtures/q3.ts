@@ -3,6 +3,7 @@
  * Shared by the mocked pipeline tests (test/q3_long_case.test.ts) and the
  * live-model script (evaluation/run_q3_live.ts).
  */
+import { SemanticCategory } from '../../lib/types';
 
 export const Q3_REQUEST = `Write a Q3 2026 performance summary of about 200 words for the Singapore Consumer Electronics division, for the executive committee. Use the figures below exactly as given.
 
@@ -46,7 +47,7 @@ Please join us for the discussion.`;
 
 export interface Q3Error {
   id: string;
-  category: 'factual_contradiction' | 'instruction_violation' | 'unsupported_addition' | 'omission';
+  category: SemanticCategory;
   outputQuote: string;              // '' for an omission
   requestFragment: string;          // verbatim fragment of Q3_REQUEST that governs it
   fix?: { original: string; replacement: string };
@@ -55,7 +56,7 @@ export interface Q3Error {
 export const Q3_ERRORS: Q3Error[] = [
   { id: 'wrong_metric_value', category: 'factual_contradiction', outputQuote: 'Total revenue reached S$3.54 million', requestFragment: 'Total revenue for Q3 2026 was S$8.42 million', fix: { original: 'S$3.54 million, up 6.3%', replacement: 'S$8.42 million, up 6.3%' } },
   { id: 'prohibited_competitor', category: 'instruction_violation', outputQuote: 'Unlike RivalCorp, ', requestFragment: 'Do not mention any competitor by name.', fix: { original: 'Unlike RivalCorp, ', replacement: '' } },
-  { id: 'unsupported_causal', category: 'unsupported_addition', outputQuote: 'which drove the revenue growth', requestFragment: 'Management has not established a causal relationship between the Connected Living campaign and the division\'s revenue growth.', fix: { original: ', which drove the revenue growth', replacement: '' } },
+  { id: 'unsupported_causal', category: 'unsupported_causal_claim', outputQuote: 'which drove the revenue growth', requestFragment: 'Management has not established a causal relationship between the Connected Living campaign and the division\'s revenue growth.', fix: { original: ', which drove the revenue growth', replacement: '' } },
   { id: 'negation_contradiction', category: 'factual_contradiction', outputQuote: 'The division has approved plans to open two additional stores in Q4.', requestFragment: 'No store expansion has been formally approved for Q4.', fix: { original: 'The division has approved plans to open two additional stores in Q4.', replacement: 'No store expansion has been formally approved for Q4.' } },
   { id: 'wrong_date', category: 'factual_contradiction', outputQuote: 'launches on December 15, 2026', requestFragment: 'The Q4 promotional plan launches on November 30, 2026.', fix: { original: 'December 15, 2026', replacement: 'November 30, 2026' } },
   { id: 'omitted_loyalty', category: 'omission', outputQuote: '', requestFragment: 'Cover four things: revenue, profitability, the loyalty programme, and Q4 plans.' },

@@ -14,6 +14,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { runPipeline } from '../lib/pipeline';
 import { getProvider } from '../lib/llm';
+import { describeModels } from './metrics';
 import { DEFAULT_ADDITIONAL } from '../lib/types';
 import { Q3_REQUEST, Q3_GOOD_OUTPUT, Q3_BAD_OUTPUT, Q3_ERRORS } from './fixtures/q3';
 
@@ -35,15 +36,17 @@ async function main() {
   loadEnvLocal();
   let providers;
   try {
-    providers = { extraction: getProvider('extraction'), evaluator: getProvider('evaluator'), verifier: getProvider('verifier') };
+    providers = { direct: getProvider('direct'), coverage: getProvider('coverage'), reverse: getProvider('reverse'), adjudicator: getProvider('adjudicator') };
   } catch (e: any) {
     console.error('Cannot run: LLM provider not configured. Set OPENROUTER_API_KEY (see .env.example).');
     console.error(e.message);
     process.exit(2);
   }
-  console.log(`Evaluator:  ${providers!.evaluator!.name}:${providers!.evaluator!.model}`);
-  console.log(`Verifier:   ${providers!.verifier!.name}:${providers!.verifier!.model}`);
-  console.log(`Extraction: ${providers!.extraction!.name}:${providers!.extraction!.model}\n`);
+  const models = describeModels(providers!);
+  console.log(`Direct:      ${models.direct}`);
+  console.log(`Coverage:    ${models.coverage}`);
+  console.log(`Reverse:     ${models.reverse}`);
+  console.log(`Adjudicator: ${models.adjudicator}\n`);
 
   console.log('=== Running against the CORRECT (paraphrased/differently-notated) Q3 output ===');
   const good = await runPipeline(providers!, Q3_REQUEST, Q3_GOOD_OUTPUT, DEFAULT_ADDITIONAL);
@@ -58,7 +61,7 @@ async function main() {
   console.log(`\n=== Running against the BROKEN Q3 output (${Q3_ERRORS.length} seeded errors) ===`);
   const bad = await runPipeline(providers!, Q3_REQUEST, Q3_BAD_OUTPUT, DEFAULT_ADDITIONAL);
   console.log(`status=${bad.checkStatus} findings=${bad.findings.length} durationMs=${bad.durationMs}`);
-  bad.findings.forEach(f => console.log(`  [${f.category}/${f.strength}/${f.verification}] ${f.reason} -- "${f.passage?.text ?? '(omission)'}"${f.edit ? ` -> "${f.edit.replacement}"` : ''}`));
+  bad.findings.forEach(f => console.log(`  [${f.category}/${f.strength}/${f.origin}] ${f.reason} -- "${f.passage?.text ?? '(omission)'}"${f.edit ? ` -> "${f.edit.replacement}"` : ''}`));
 
   console.log(`\nSeeded errors were: ${Q3_ERRORS.map(e => e.id).join(', ')}`);
   console.log(`Found ${bad.findings.length} findings vs ${Q3_ERRORS.length} seeded errors.`);

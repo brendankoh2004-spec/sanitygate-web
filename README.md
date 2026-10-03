@@ -12,61 +12,89 @@ or a live database until you provide real credentials in step 2–3.
 
 ## Architecture
 
-SanityGate deliberately splits the review into layers with narrow,
-non-overlapping jobs:
+**Wide at detection, narrow at adjudication.** Four independent branches
+look for possible errors in parallel; only possible errors move forward; one
+adjudicator resolves them. Clean material is never re-reviewed.
 
 ```
-Browser (no secrets)
-  -> POST /api/check  (streams NDJSON progress events, then a final result)
-       -> deterministic checks   (lib/validators/deterministic.ts)
-            word count, required/forbidden terms, list format, leftover
-            placeholders — ONLY things whose answer never depends on
-            understanding language. No numbers, dates, money, or meaning.
-       -> semantic review        (lib/semantic.ts, lib/prompts.ts)
-            1. extraction  -> splits the request into a validated
-               requirement ledger (every quote checked against the real
-               request text; anything the model skips is added back
-               programmatically so nothing is silently ungraded)
-            2. evaluator   -> judges every ledger item individually
-               (instruction followed? fact preserved? same subject as
-               what the request describes, or a different metric/period
-               entirely?), plus a separate pass for unsupported/causal
-               claims the request doesn't back up
-            3. verifier    -> TWO independent jobs, run in parallel:
-                 VERIFY: re-checks each evaluator claim from scratch,
-                   without seeing the evaluator's reasoning, and must
-                   supply its OWN grounded quotes to confirm anything
-                 SCAN:   an independent read of the raw request/output
-                   with no requirement ledger and no candidate list —
-                   a safety net for what the evaluator missed
-       -> evidence validation    (lib/evidence.ts)
-            every quote a model claims is located in the REAL request/
-            output text before it can be shown; nothing sliced from a
-            model's own copy of a passage is ever displayed
-       -> merge + status         (lib/pipeline.ts)
-            deterministic findings win on a shared passage; duplicate
-            semantic findings about the same issue collapse into one;
-            status is always one of clean / findings / needs_review /
-            check_incomplete — a failed or partial review is NEVER
-            represented as "clean"
-       -> persistence            (lib/records.ts, lib/supabase.ts)
-  <- NDJSON stream: stage events (Analysing/Reviewing/Verifying/Finalising),
-     then one result event with the findings, or one error event
+REQUEST + OUTPUT
+      |
+      +------------+------------+------------+
+      v            v            v            v
+ DIRECT MATCH  COVERAGE     REVERSE      DETERMINISTIC     (one Promise.all; independent)
+               TRACE        CHECK        CHECKS (code)
+      |            |            |            |
+      +--- PASS: discarded ---- FAIL: becomes a candidate ---+
+                                                              v
+                                ERROR POOL (one flat list: D1.. deterministic, E1.. reviewers)
+                                                              |
+                          no reviewer error? -> done, no model call
+                                                              v
+                                                ADJUDICATOR (one call)
+                                                              v
+                              FINAL FINDINGS -> grounded quotes -> validated fix
 ```
 
-The LLM is only ever called from `app/api/*/route.ts`, which run server-side.
-`OPENROUTER_API_KEY` never ships to the browser.
+- **Deterministic checks** (`lib/validators/deterministic.ts`): word count,
+  list format, required/forbidden terms, leftover placeholders — only things
+  whose answer never depends on understanding language. This is a *sibling*
+  branch of the reviewers, not a stage in front of them: it is CPU-only,
+  started after the model calls are in flight, and a crash in it fails only
+  its own branch. A failure is proven by code, so it is a final finding that
+  needs no adjudication; it enters the pool as context (so the adjudicator
+  can mark a reviewer's duplicate of it) and is never re-judged by a model. A
+  pass is discarded.
+- **Direct Match**: is the OUTPUT, as a whole, an appropriate response to
+  what the user communicated? Catches contextual mismatches ("I'm going to
+  Japan next week." → "How was your weekend?") without turning every
+  sentence of the request into a requirement.
+- **Coverage Trace**: is meaningful information, a question, a constraint or
+  a prohibition in the REQUEST omitted, contradicted or mishandled? Word and
+  list-item counts are measured by code and handed to it.
+- **Reverse Check**: reads the OUTPUT first, states what task it is actually
+  answering (`inferred_task`), then compares that with the REQUEST. Catches
+  output that looks related but answers a different question, and claims the
+  request doesn't support (including unsupported causal claims). A single
+  prompt reduces but cannot fully remove anchoring on the request.
+- **Error pool**: every reviewer error is appended as-is. There is no
+  matching, clustering or dedup before adjudication; reviewers may agree,
+  disagree or overlap.
+- **Adjudicator**: resolves pooled reviewer candidates only (decisions are
+  keyed by candidate id; anything else is ignored). For each: confirmed /
+  rejected / uncertain, `duplicate_of`, final category and severity, its own
+  quotes, reason, and the smallest safe fix. It is told it is not a reviewer,
+  and it alone carries the category definitions.
+- **Evidence and edits** (`lib/evidence.ts`, `lib/edits.ts`): every displayed
+  quote is located in the real request/output; every fix is validated against
+  the real output (exact, unique, touching the flagged passage).
+- **No adjudicator on clean output**: the adjudicator is called only if at
+  least one *reviewer* raised an error (an execution-path guard in
+  `lib/review.ts`, not a prompt hint). Deterministic failures alone never
+  trigger it: code already proved them.
 
-`lib/llm/provider.ts` defines a provider-agnostic `LLMProvider` interface.
-`lib/llm/openrouter.ts` is the only implementation today. To add Gemini,
-Anthropic, or OpenAI later, implement `LLMProvider` in a new file under
-`lib/llm/` and add one case to `lib/llm/index.ts` — nothing else changes.
-Model selection is intentionally minimal and opaque: `OPENROUTER_MODEL` (or
-per-stage `EVALUATOR_MODEL` / `VERIFIER_MODEL` / `EXTRACTION_MODEL`) is
-passed straight through to the provider. Nothing in the pipeline assumes a
-specific model behaves perfectly — every response is validated, retried
-once where that's sensible, and any residual failure becomes an honest
-`check_incomplete` result rather than a crash or a false "clean".
+Categories (single definition, `SEMANTIC_CATEGORIES` in `lib/types.ts`):
+`instruction_violation`, `factual_contradiction`, `unsupported_addition`,
+`omission`, `unsupported_causal_claim`.
+
+Status is always one of `clean` / `findings` / `needs_review` /
+`check_incomplete`. A failed or partial review is **never** shown as clean.
+One reviewer failing keeps the other branches' candidates (a role with no
+configured provider fails alone as `unavailable`); if the adjudicator
+fails, candidates survive as `uncertain`/`unadjudicated` (no fabricated
+certainty), exact-span duplicates are collapsed in code, and the check is
+marked incomplete. A request with no text (only "must include a CTA") runs
+Coverage Trace alone, plus the deterministic branch.
+
+Latency is `max(deterministic, direct, coverage, reverse) + adjudicator`, and
+the adjudicator only when a reviewer raised an error. Every branch records
+model, prompt size, max tokens, timeout and latency in `checks.diagnostics`.
+
+The LLM is only ever called from server-side routes. `lib/llm/provider.ts`
+is a provider-agnostic interface; `lib/llm/openrouter.ts` is the only
+implementation. Models: `OPENROUTER_MODEL`, optionally overridden per role
+with `DIRECT_MODEL` / `COVERAGE_MODEL` / `REVERSE_MODEL` /
+`ADJUDICATOR_MODEL`. Pointing the reviewers at different model families is
+the cheapest way to decorrelate their blind spots; nothing requires it.
 
 ## 1. Install
 
@@ -78,228 +106,168 @@ npm install
 
 1. Create a free project at https://supabase.com.
 2. Open the SQL editor and run the contents of `db/schema.sql` once.
-   - **Already have a SanityGate database from an earlier version of this
-     project?** `db/schema.sql` uses `create table if not exists`, which
-     does nothing to a table that already exists — it will NOT add or
-     rename columns for you. Run every file in `db/migrations/` in order
-     (`0001_sync_two_box_schema.sql`, `0002_add_check_status.sql`,
-     `0003_diagnostics_and_cleanup.sql` — all idempotent, safe to run
-     once or re-run), then re-run `db/schema.sql`.
+   - **Already have a SanityGate database from an earlier version?**
+     `db/schema.sql` uses `create table if not exists`, which does nothing to
+     an existing table. Run every file in `db/migrations/` in order (`0001`
+     … `0004_parallel_review_architecture.sql`; all idempotent), then re-run
+     `db/schema.sql`. `0004` is required: it makes the retired
+     `evaluator_model` / `verifier_model` / `extraction_model` columns of
+     `eval_runs` nullable and adds `reviewer_model` / `adjudicator_model`;
+     without it, every evaluation-run insert is rejected.
+     Historical data is kept: `checks.extracted_requirements` is no longer
+     written or read but is not dropped (the migration says how to drop it
+     if you want to), and old findings are read back with origin `legacy`.
 3. Under Project Settings → API, copy:
    - **Project URL** → `NEXT_PUBLIC_SUPABASE_URL`
    - **service_role key** (not the anon key) → `SUPABASE_SERVICE_ROLE_KEY`
 
 The service-role key is server-only and bypasses Row Level Security —
-that's intentional (see `db/schema.sql` for why RLS is enabled with no
-policies: the anon key, if it ever leaked, would have zero table access).
+that's intentional (see `db/schema.sql`: RLS is enabled with no policies, so
+a leaked anon key has zero table access).
 
-`checks.diagnostics` (per-stage outcomes, model ids, internal counters) is
-persisted for debugging but is never selected by `app/api/history` or
-`app/api/admin/stats`, so it can never reach the browser.
+`checks.diagnostics` is persisted for debugging but is never selected by
+`app/api/history` or `app/api/admin/stats`, so it can never reach the browser.
 
 ## 3. LLM provider (OpenRouter)
 
-1. Create a free account at https://openrouter.ai and generate an API key
-   under https://openrouter.ai/keys → `OPENROUTER_API_KEY`.
-2. Check https://openrouter.ai/models?max_price=0 for the current list of
-   free models and pick one with a decent context window and reliable
-   instruction-following. Set it as `OPENROUTER_MODEL`. This list changes
-   over time — the provider abstraction makes swapping trivial.
-3. Optional: set `EVALUATOR_MODEL` / `VERIFIER_MODEL` differently from each
-   other. Since correlated mistakes are exactly what the verifier exists to
-   catch, pointing it at a different model family is the cheapest lever
-   for reducing correlated errors — but nothing requires it; all three
-   stages default to `OPENROUTER_MODEL`.
-4. Set `OPENROUTER_SITE_URL` / `OPENROUTER_SITE_NAME` to your real deployed
-   URL once you have one (some free models require this for attribution).
+1. Create an account at https://openrouter.ai and generate a key at
+   https://openrouter.ai/keys → `OPENROUTER_API_KEY`.
+2. Pick a model with a decent context window and reliable
+   instruction-following → `OPENROUTER_MODEL` (see
+   https://openrouter.ai/models?max_price=0 for free ones).
+3. Optional: `DIRECT_MODEL`, `COVERAGE_MODEL`, `REVERSE_MODEL`,
+   `ADJUDICATOR_MODEL` to use a different model per role (each defaults to
+   `OPENROUTER_MODEL`).
+4. Set `OPENROUTER_SITE_URL` / `OPENROUTER_SITE_NAME` to your deployed URL.
 
 ## 4. Admin key
-
-Generate a random secret for the admin dashboard:
 
 ```bash
 openssl rand -hex 32
 ```
 
-Set it as `ADMIN_API_KEY`. This is the value you'll paste into `/admin`
-to view pilot analytics and run the checker evaluation.
+Set it as `ADMIN_API_KEY`; paste it into `/admin` to view analytics and run
+the checker evaluation.
 
 ## 5. Local development
 
 ```bash
 cp .env.example .env.local
-# fill in the values from steps 2-4
 npm run dev
 ```
 
-Visit http://localhost:3000. The check screen still runs deterministic
-checks with no LLM key configured — it reports the review as incomplete
-rather than faking a clean result (see `lib/pipeline.ts`).
+With no LLM key configured, deterministic checks still run and any check that
+needs the semantic review reports itself as incomplete rather than clean.
 
 ## 6. Run the tests
 
-Two separate test layers, deliberately kept separate:
-
 ```bash
-npm run test:unit       # no network/API key needed — runs in seconds
-npm run eval             # requires a real OPENROUTER_API_KEY — live LLM calls, ~60 golden cases
-npm run eval:q3-live     # requires a real OPENROUTER_API_KEY — manual spot-check on one long realistic document
+npm run test:unit       # no network/API key needed
+npm run eval            # needs OPENROUTER_API_KEY — live calls, golden cases
+npm run eval:q3-live    # needs OPENROUTER_API_KEY — one long realistic document
 ```
 
-**`npm run test:unit`** (`test/`) runs every `*.test.ts` file in `test/` as
-a separate process (one file's failure doesn't stop the rest) against
-mocked/scripted providers — no network, no API key, safe for CI on every
-commit:
+`npm run test:unit` runs every `test/*.test.ts` as a separate process against
+scripted providers:
 
-- `deterministic.test.ts` — word count, required/forbidden terms, format,
-  placeholders, and a static guard that no numeric/date/context-matching
-  code has crept back into the deterministic layer.
-- `evidence_edits.test.ts` — quote-location/evidence validation and the
-  targeted-edit engine (accept/undo in any order converges to the same
-  text; edits never corrupt each other's offsets).
-- `llm_provider.test.ts` — the OpenRouter provider against a mocked
-  `fetch`: empty/malformed/truncated responses, timeouts on slow headers
-  *and* a stalled body, 429/5xx, an HTTP-200 body carrying a provider
-  error, and the JSON-salvage logic.
-- `semantic.test.ts` — the ledger, the evaluator's local gating (same-
-  subject / not-a-paraphrase), and the verifier's two jobs: a real issue
-  confirmed, a false positive rejected and dropped, a verifier mistake
-  that the independent scan still corroborates (shown as uncertain, not
-  silently resolved either way), an evaluator miss the scan alone catches,
-  an evaluator outage the scan still protects against, and a verifier
-  outage that never lets a finding be marked "confirmed" regardless.
-- `resilience.test.ts` — every failure mode in `runStage` (empty/malformed/
-  truncated/timeout/rate-limit/upstream-error, each with the correct
-  retry-or-not behavior), the platform timeout boundary (a stage is
-  skipped, never attempted, once too little budget remains), and
-  full-pipeline degradation (no provider configured, an unexpected
-  exception, extraction failing while the rest of the review still runs).
-- `checkService.test.ts` — the streamed NDJSON events end-to-end: the four
-  product-facing stages appear in order, a persistence failure never hides
-  the result, and an unexpected crash produces exactly one error event and
-  no fabricated result.
-- `persistence.test.ts` — `db/schema.sql` actually has every column the
-  app writes (parsed from the file itself, so this fails loudly if they
-  ever drift apart again), every migration looks idempotent, and old rows
-  from the previous pipeline are read correctly (legacy finding shapes
-  remapped, `check_status` inferred from `semantic_error` when absent).
-- `q3_long_case.test.ts` — a realistic ~200-word multi-metric Q3 report
-  (`evaluation/fixtures/q3.ts`) with 7 deliberately seeded errors spanning
-  every finding category. The scripted evaluator/verifier decide every
-  verdict dynamically from the real output text (not hardcoded per run),
-  so this proves the pipeline — not the mock — understands which number
-  belongs to which statement: the same figure (`S$3.54 million`) is used
-  correctly for one metric and incorrectly for another in the same
-  document, and only the wrong usage is flagged.
+- `review.test.ts` — the architecture: four parallel branches (deterministic
+  included, never a gate), PASS discarded, flat pool, unmatched candidates,
+  `duplicate_of` consolidation, the adjudicator unable to invent findings,
+  rejection, branch/adjudicator failure, grounded evidence,
+  `unsupported_causal_claim`, omission anchors, CTA-only runs, deterministic
+  failures in the pool, prompt design (no category definitions in reviewers),
+  stage diagnostics.
+- `architecture.test.ts` — guard: fails if the retired
+  extraction/ledger/evaluator/verify/scan vocabulary reappears in production
+  code, or the wiring (one `Promise.all` containing the deterministic branch,
+  a single adjudicator, the empty-candidate early return, one category
+  definition) changes.
+- `resilience.test.ts` — every failure degrades to an honest incomplete,
+  one failing reviewer never erases the others, nothing is called once the
+  budget is gone.
+- `checkService.test.ts` — streamed stages (`reviewing` / `confirming` /
+  `finalising`; `confirming` only when there is something to adjudicate),
+  persistence failures, crash handling.
+- `persistence.test.ts` — the schema has every column the app writes,
+  migrations are idempotent, `0004` does what the code needs, legacy rows
+  read back correctly.
+- `q3_long_case.test.ts` — a long multi-metric report with 7 seeded errors;
+  the same figure used correctly for one metric and wrongly for another is
+  flagged only where wrong; a correct, paraphrased version costs no
+  adjudicator call.
+- `deterministic.test.ts`, `evidence_edits.test.ts`, `llm_provider.test.ts`.
 
-**`npm run eval`** (`evaluation/`) runs all cases in
-`evaluation/golden_cases.json` against your live provider and prints
-precision, recall, false-positive rate, evidence accuracy, suggestion-
-grounding accuracy, and requirement-extraction accuracy. It writes a
-timestamped result to `evaluation/results/`. To lock in a baseline for
-future regression detection:
+**`npm run eval`** runs `evaluation/golden_cases.json` against your live
+provider and prints precision, recall, false-positive rate, evidence accuracy
+and suggestion-grounding accuracy, writing a result to `evaluation/results/`.
+(The retired `expectedExtractionTypes` field has been removed from the cases.) To lock in
+a baseline:
 
 ```bash
 cp evaluation/results/run-<timestamp>.json evaluation/results/baseline.json
 ```
 
-Re-run `npm run eval` whenever you change a prompt in `lib/prompts.ts`; it
-exits with code 1 on a regression (wire this into CI).
-
-**`npm run eval:q3-live`** runs the same Q3 fixture used in
-`q3_long_case.test.ts` against your real configured model and prints every
-finding it produces, for a quick human sanity check that the prompts work
-in practice and not just against the scripted test double.
+It exits 1 on a regression; re-run it whenever you change a prompt in
+`lib/prompts.ts`.
 
 ### Diagnosing an incomplete review in production
 
-If the app ever shows "The review could not be fully completed," check the
-Vercel function logs for a line starting `[sanitygate:<stage>]` — `stage`
-is one of `extraction`, `evaluator[i/n]`, `verify`, or `scan`, telling you
-exactly which call failed and why (timeout, rate limit, upstream HTTP
-error, or a JSON parse failure, including whether a *partial* result was
-salvaged before giving up). These logs never include prompt text, request/
-output content, or API keys — only the failing stage, model name, and
-error/timing diagnostics. The same diagnostics are also persisted per-check
-in `checks.diagnostics` (never exposed to the browser) if you need to look
-at a specific past check.
+Check the function logs for `[sanitygate:<stage>]` where stage is `direct`,
+`coverage`, `reverse`, `deterministic` or `adjudicator`, which tells you which
+branch failed and why (timeout, rate limit, upstream error, unusable JSON,
+salvaged partial, no provider configured).
+Logs never include prompt text, request/output content or keys. Per-stage
+model, prompt size, max tokens, timeout, latency and outcome are persisted in
+`checks.diagnostics`.
 
 ## 7. Deploy to Vercel
 
 ```bash
-npm i -g vercel   # or use the Vercel web UI
+npm i -g vercel
 vercel
 ```
 
-In the Vercel project settings, add every variable from `.env.example`
-(with real values) under **Environment Variables** — do this before your
-first production deploy. Then:
+Add every variable from `.env.example` in the Vercel project settings before
+the first production deploy, then `vercel --prod`.
 
-```bash
-vercel --prod
-```
-
-Your public URL (e.g. `https://sanitygate.vercel.app`) is what you send to
-pilot users. No login, no Claude account, no API key of their own required.
-
-## 8. Verify it's really live (do this before sending the link to anyone)
+## 8. Verify it's really live
 
 1. Visit the deployed URL in an incognito window.
-2. Run the landing page's "See an example" check and watch the four
-   progress stages (Analysing / Reviewing / Verifying / Finalising).
-3. Confirm the result includes findings — that confirms a real LLM call
-   happened, not just deterministic checks.
-4. Open `/admin`, paste your `ADMIN_API_KEY`, click **Run checker
-   evaluation**, and confirm real precision/recall numbers come back.
+2. Run the landing page's "See an example" check and watch the progress
+   stages (Reviewing / Confirming / Finalising).
+3. Confirm the result includes findings — that proves a real LLM call.
+4. Open `/admin`, paste `ADMIN_API_KEY`, click **Run checker evaluation**.
 
 ## What's stored, and what isn't
 
-- `checks`: request text, output text, requirements, and findings — needed
-  to show history. Raw text is **not** included in any aggregate analytics
-  query (`app/api/admin/stats/route.ts` only ever selects `findings`,
-  `has_reference`, `check_status`, timestamps — never `request`/`output`).
-- No account system. A random UUID is generated client-side and stored in
-  `localStorage` so a returning visitor sees their own history; it is not
-  tied to an email or any identity.
-- Whatever your configured OpenRouter model/provider does with submitted
-  prompts is governed by **their** terms, not this project's — check
-  https://openrouter.ai/privacy and your chosen model's provider page
-  before pasting confidential material, and say so on your own pilot's
-  landing/privacy copy.
+- `checks`: request text, output text and findings — needed to show history.
+  Aggregate analytics never select `request`/`output`.
+- No account system. A random UUID in `localStorage` links a returning
+  visitor to their own history; it is not tied to any identity.
+- Whatever your OpenRouter model/provider does with submitted prompts is
+  governed by **their** terms — see https://openrouter.ai/privacy before
+  pasting confidential material, and say so in your pilot's privacy copy.
 - `app_config.retention_days` documents an intended retention window; no
-  scheduled deletion job ships by default (see comment in `db/schema.sql`)
-  — add a Supabase cron job before treating this as a real retention
-  policy.
+  deletion job ships by default — add a Supabase cron job first.
 
 ## Known limitations
 
-- Rate limiting is per-IP via a Postgres counter (`db/schema.sql` →
-  `increment_rate_limit`), which is correct across Vercel's serverless
-  instances. It fails open if Supabase is unreachable.
-- Free OpenRouter models are rate-limited by OpenRouter itself, independent
-  of this app's own per-IP limit. A `429` surfaces as "SanityGate has
-  reached its capacity for now" — never as a fake clean result.
-- Small/free models are less reliable at strict JSON output and nuanced
-  judgment than a frontier model. `lib/llm/openrouter.ts` salvages a
-  partial result when a response is truncated mid-object, and retries
-  once on an unusable/incomplete response — but a sufficiently
-  non-compliant or slow model can still exhaust its retry and surface an
-  honest `check_incomplete` result.
-- **Vercel function time budget**: `app/api/check/route.ts` sets
-  `maxDuration = 60` (the ceiling on Vercel's free/hobby tier).
-  `PIPELINE_BUDGET_MS` (default 50000) keeps the pipeline's own soft
-  budget a few seconds under that, so a stage that can't fit in the
-  remaining time is skipped and reported as incomplete rather than being
-  cut off mid-call by the platform. If you move to a Pro plan and raise
-  `maxDuration`, raise `PIPELINE_BUDGET_MS` correspondingly.
-- A very large request is split into `EVALUATOR_BATCH_SIZE` (default 10)
-  requirement items per evaluator call, run in parallel. The "unsupported
-  claims" pass only runs on the first batch — for an unusually long
-  document with many instructions/facts, raising `EVALUATOR_BATCH_SIZE`
-  ensures that pass sees the whole document in one call, at the cost of a
-  slower (but single) evaluator call instead of several parallel ones.
-- No account system by design for the pilot. History is per-browser, not
-  per-person — clearing localStorage loses the link to past checks (the
-  checks themselves stay in the database). Per-finding accept/ignore
-  decisions are client-side only for this pass and are not restored when
-  reopening a check from history; only the review results themselves are.
+- Rate limiting is per-IP via a Postgres counter; it fails open if Supabase
+  is unreachable. Free OpenRouter models are rate-limited independently; a
+  `429` surfaces as "SanityGate has reached its capacity", never as clean.
+- Small/free models are weaker at strict JSON and nuanced judgment.
+  `lib/llm/openrouter.ts` salvages truncated responses and the pipeline
+  retries once, but a non-compliant or slow model can still produce an
+  honest `check_incomplete`.
+- **Time budget**: `maxDuration = 60` (Vercel Hobby). `PIPELINE_BUDGET_MS`
+  (default 50000) keeps the soft budget under it; the reviewers share 60% of
+  it as one absolute deadline and the adjudicator keeps the rest. Raise both
+  together on a Pro plan.
+- The adjudicator receives the full REQUEST and OUTPUT as grounding context
+  (omissions and insertion anchors need the whole output), so its prompt
+  grows with document size. There is a hard cap of 10 issues per reviewer.
+- If the adjudicator fails, unresolved candidates are shown as uncertain;
+  only identical exact spans are collapsed, so two reviewers flagging
+  overlapping-but-different spans of one problem can both appear.
+- History is per-browser. Per-finding accept/ignore decisions are
+  client-side only and are not restored from history.

@@ -15,7 +15,7 @@ export async function GET(req: NextRequest) {
   // `diagnostics` and `semantic_error` can never reach the browser.
   const { data, error } = await supabase
     .from('checks')
-    .select('id, session_id, created_at, request, output, additional, extracted_requirements, findings, passed_checks, word_count, duration_ms, has_reference, check_status, semantic_error')
+    .select('id, session_id, created_at, request, output, additional, findings, passed_checks, word_count, duration_ms, has_reference, check_status, semantic_error')
     .eq('session_id', sessionId)
     .order('created_at', { ascending: false })
     .limit(50);

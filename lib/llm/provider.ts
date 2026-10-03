@@ -10,7 +10,7 @@ export class LLMError extends Error {
 }
 
 /** Pipeline stage using the provider. Each can be pointed at a different model (optional). */
-export type LLMRole = 'extraction' | 'evaluator' | 'verifier';
+export type LLMRole = 'direct' | 'coverage' | 'reverse' | 'adjudicator';
 
 export interface LLMJsonOptions {
   temperature?: number;

@@ -20,9 +20,9 @@ export interface CheckDeps {
  */
 export async function processCheck(input: CheckInput, deps: CheckDeps, send: (e: StreamEvent) => void): Promise<void> {
   try {
-    send({ type: 'stage', stage: 'analysing' });
+    send({ type: 'stage', stage: 'reviewing' });
     const result = await runPipeline(deps.providers, input.request, input.output, input.additional, {
-      onStage: s => { if (s !== 'analysing') send({ type: 'stage', stage: s }); },
+      onStage: s => { if (s !== 'reviewing') send({ type: 'stage', stage: s }); },   // 'reviewing' already sent; 'confirming' only when there are candidates
     });
     const rec = toClientRecord({
       id: (deps.newId || (() => crypto.randomUUID()))(), sessionId: input.sessionId,

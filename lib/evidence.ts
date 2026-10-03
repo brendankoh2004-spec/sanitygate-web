@@ -84,32 +84,3 @@ export function findSpan(haystack: string, needle: string | null | undefined): S
 export function spanOverlap(a: Span, b: Span): number {
   return Math.max(0, Math.min(a.end, b.end) - Math.max(a.start, b.start));
 }
-
-/** Two spans describe the same location if they overlap by >=50% of the shorter one. */
-export function sameLocation(a: Span, b: Span): boolean {
-  const shorter = Math.min(a.end - a.start, b.end - b.start);
-  if (shorter <= 0) return false;
-  return spanOverlap(a, b) / shorter >= 0.5;
-}
-
-/** Sentence spans; a '.' followed by a non-space (e.g. the decimal point in "$8.42") does not end a sentence. */
-export function splitSentences(text: string): Span[] {
-  const out: Span[] = [];
-  let start = 0;
-  const push = (s: number, e: number) => {
-    while (s < e && /\s/.test(text[s])) s++;
-    while (e > s && /\s/.test(text[e - 1])) e--;
-    if (e > s) out.push({ start: s, end: e });
-  };
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (ch === '\n') { push(start, i); start = i + 1; continue; }
-    if (ch === '.' || ch === '!' || ch === '?') {
-      let j = i;
-      while (j + 1 < text.length && '.!?"\u201D\')'.includes(text[j + 1])) j++;
-      if (j + 1 >= text.length || /\s/.test(text[j + 1])) { push(start, j + 1); start = j + 1; i = j; }
-    }
-  }
-  push(start, text.length);
-  return out;
-}

@@ -4,7 +4,8 @@ import { getProvider } from '../lib/llm';
 import { check, done } from './helpers';
 
 process.env.OPENROUTER_API_KEY = 'test-key';
-delete process.env.OPENROUTER_MODEL; delete process.env.EVALUATOR_MODEL; delete process.env.VERIFIER_MODEL; delete process.env.EXTRACTION_MODEL;
+delete process.env.OPENROUTER_MODEL;
+for (const k of ['DIRECT', 'COVERAGE', 'REVERSE', 'ADJUDICATOR']) delete process.env[`${k}_MODEL`];
 
 const realFetch = globalThis.fetch;
 type Handler = (url: string, init: any) => Promise<any>;
@@ -21,14 +22,17 @@ async function main() {
   check('model default is the OpenRouter router; no model env is required', new OpenRouterProvider().model === DEFAULT_MODEL && DEFAULT_MODEL === 'openrouter/free');
   process.env.OPENROUTER_MODEL = 'some/any-model:whatever';
   check('OPENROUTER_MODEL is passed through verbatim (opaque)', new OpenRouterProvider().model === 'some/any-model:whatever');
-  process.env.VERIFIER_MODEL = 'other/verifier';
-  check('per-stage override is optional and independent', getProvider('verifier').model === 'other/verifier' && getProvider('evaluator').model === 'some/any-model:whatever' && getProvider('extraction').model === 'some/any-model:whatever');
-  process.env.EVALUATOR_MODEL = 'eval/model';
-  check('extraction follows evaluator override unless set', getProvider('extraction').model === 'eval/model');
+  process.env.ADJUDICATOR_MODEL = 'other/adjudicator';
+  check('per-role override is optional and independent: only the adjudicator changes', getProvider('adjudicator').model === 'other/adjudicator' && (['direct', 'coverage', 'reverse'] as const).every(r => getProvider(r).model === 'some/any-model:whatever'));
+  process.env.REVERSE_MODEL = 'other/reverse';
+  check('each reviewer role can be pointed at its own model', getProvider('reverse').model === 'other/reverse' && getProvider('direct').model === 'some/any-model:whatever' && getProvider('coverage').model === 'some/any-model:whatever');
+  process.env.EVALUATOR_MODEL = 'retired/model'; process.env.VERIFIER_MODEL = 'retired/model'; process.env.EXTRACTION_MODEL = 'retired/model';
+  check('retired *_MODEL variables (EVALUATOR/VERIFIER/EXTRACTION) have no effect on any role', (['direct', 'coverage', 'reverse', 'adjudicator'] as const).every(r => getProvider(r).model !== 'retired/model'));
+  delete process.env.EVALUATOR_MODEL; delete process.env.VERIFIER_MODEL; delete process.env.EXTRACTION_MODEL;
   delete process.env.OPENROUTER_API_KEY;
   let threw = false; try { new OpenRouterProvider(); } catch { threw = true; }
   check('missing API key throws at construction (route degrades to an incomplete review)', threw);
-  process.env.OPENROUTER_API_KEY = 'test-key'; delete process.env.EVALUATOR_MODEL; delete process.env.VERIFIER_MODEL;
+  process.env.OPENROUTER_API_KEY = 'test-key'; delete process.env.ADJUDICATOR_MODEL; delete process.env.REVERSE_MODEL;
   const p = new OpenRouterProvider();
 
   // ---- success ----
@@ -48,8 +52,8 @@ async function main() {
   check('non-JSON HTTP body -> invalid_response', (await expectErr(p.completeJSON('x')))?.code === 'invalid_response');
   mockFetch(async () => chat('I cannot help with that.'));
   check('malformed (prose) model output -> invalid_response', (await expectErr(p.completeJSON('x')))?.code === 'invalid_response');
-  mockFetch(async () => chat('{"judgments":[{"id":"R1","verdict":"satisfied"},{"id":"R2","verd'));
-  check('truncated output: a repaired prefix is returned but flagged partial', await p.completeJSON<any>('x').then(v => v.partial === true && v.value.judgments.length === 1 && v.value.judgments[0].id === 'R1'));
+  mockFetch(async () => chat('{"decisions":[{"id":"E1","verdict":"confirmed"},{"id":"E2","verd'));
+  check('truncated output: a repaired prefix is returned but flagged partial', await p.completeJSON<any>('x').then(v => v.partial === true && v.value.decisions.length === 1 && v.value.decisions[0].id === 'E1'));
   mockFetch(async () => chat('{"a":1', 'length'));
   check('truncated with nothing complete to keep -> invalid_response', (await expectErr(p.completeJSON('x')))?.code === 'invalid_response');
 
@@ -88,10 +92,10 @@ async function main() {
 
   // ---- extractJson unit checks over every response shape used by the app ----
   const shapes: [string, string, (v: any) => boolean][] = [
-    ['requirements', '{"items":[{"kind":"fact","quote":"a"},{"kind":"instruction","quote":"b"},{"kind":"fa', v => v.items.length === 2],
-    ['judgments+unrequested', '{"judgments":[{"id":"R1","verdict":"satisfied"}],"unrequested":[{"output_quote":"q","reason":"r"},{"output_qu', v => v.judgments.length === 1 && v.unrequested.length === 1],
-    ['verifications', '{"verifications":[{"cid":"C1","verdict":"confirmed","reason":"has } brace and \\"quote\\""},{"cid":"C2","ver', v => v.verifications.length === 1 && /brace/.test(v.verifications[0].reason)],
-    ['scan', '{"findings":[{"category":"omission","fix":{"original":"a","replacement":"b"}},{"category":"x","fix":{"orig', v => v.findings.length === 1 && v.findings[0].fix.replacement === 'b'],
+    ['reviewer issues', '{"status":"issues","issues":[{"type":"omission","reason":"a"},{"type":"unsupported_causal_claim","reason":"b"},{"type":"om', v => v.issues.length === 2 && v.issues[1].type === 'unsupported_causal_claim'],
+    ['reverse check with inferred_task', '{"inferred_task":"explains deadlines","status":"issues","issues":[{"type":"omission","reason":"r"},{"type":"x","rea', v => v.inferred_task === 'explains deadlines' && v.issues.length === 1],
+    ['adjudicator decisions', '{"decisions":[{"id":"E1","verdict":"confirmed","reason":"has } brace and \\"quote\\""},{"id":"E2","ver', v => v.decisions.length === 1 && /brace/.test(v.decisions[0].reason)],
+    ['adjudicator decision with a nested fix', '{"decisions":[{"id":"E1","verdict":"confirmed","fix":{"original":"a","replacement":"b"}},{"id":"E2","fix":{"orig', v => v.decisions.length === 1 && v.decisions[0].fix.replacement === 'b'],
   ];
   for (const [name, text, ok] of shapes) {
     const x = extractJson(text);

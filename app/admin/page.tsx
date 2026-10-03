@@ -96,14 +96,13 @@ export default function AdminPage() {
       {evalResult && (
         <div style={{ marginTop: 28 }}>
           <h2 style={{ fontSize: 16.5 }}>Checker evaluation — live run</h2>
-          <p style={{ fontSize: 13, color: 'var(--ink-soft)' }}>Evaluator: {evalResult.evaluatorModel} · Verifier: {evalResult.verifierModel} · Extraction: {evalResult.extractionModel} · {evalResult.summary.totalCases} golden cases</p>
+          <p style={{ fontSize: 13, color: 'var(--ink-soft)' }}>Direct: {evalResult.models.direct} · Coverage: {evalResult.models.coverage} · Reverse: {evalResult.models.reverse} · Adjudicator: {evalResult.models.adjudicator} · {evalResult.summary.totalCases} golden cases</p>
           <div className="stat-grid">
             <div className="stat-card"><div className="sn">{evalResult.summary.precision ?? '—'}</div><div className="sl">Precision</div></div>
             <div className="stat-card"><div className="sn">{evalResult.summary.recall ?? '—'}</div><div className="sl">Recall</div></div>
             <div className="stat-card"><div className="sn">{evalResult.summary.falsePositiveRate ?? '—'}</div><div className="sl">False positive rate</div></div>
             <div className="stat-card"><div className="sn">{evalResult.summary.evidenceAccuracy ?? '—'}</div><div className="sl">Evidence accuracy</div></div>
             <div className="stat-card"><div className="sn">{evalResult.summary.suggestionGroundingAccuracy ?? '—'}</div><div className="sl">Suggestion grounding</div></div>
-            <div className="stat-card"><div className="sn">{evalResult.summary.requirementExtractionAccuracy ?? '—'}</div><div className="sl">Requirement extraction accuracy</div></div>
             <div className="stat-card"><div className="sn">{evalResult.summary.semanticFailures}</div><div className="sl">Semantic call failures</div></div>
           </div>
           <div style={{ marginTop: 16 }}>

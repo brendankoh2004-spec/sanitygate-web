@@ -46,13 +46,13 @@ Best,
 The Atlas Team`;
 
 // ---------------------------------------------------------------------
-// Four product-facing stages (spec section 9). No internal pipeline
-// terminology ("Call 1", "deterministic validator", ...) ever appears here.
+// Three product-facing stages. No internal pipeline terminology
+// ("reviewer", "adjudicator", "deterministic", ...) ever appears here.
+// "Confirming" is skipped when the review found nothing to confirm.
 // ---------------------------------------------------------------------
 const STAGES: { key: CheckStage; label: string }[] = [
-  { key: 'analysing', label: 'Analysing' },
   { key: 'reviewing', label: 'Reviewing' },
-  { key: 'verifying', label: 'Verifying' },
+  { key: 'confirming', label: 'Confirming' },
   { key: 'finalising', label: 'Finalising' },
 ];
 
@@ -97,7 +97,7 @@ export default function Page() {
     if (!output.trim()) { setErrorMsg('Paste the AI output to check first.'); return; }
     setErrorMsg('');
     setRunning(true);
-    setStage('analysing');
+    setStage('reviewing');
     try {
       const res = await fetch('/api/check', {
         method: 'POST',

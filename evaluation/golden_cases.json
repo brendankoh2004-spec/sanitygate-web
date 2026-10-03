@@ -8,10 +8,7 @@
       "shouldFlag": true,
       "matchSubstring": "$19",
       "evidenceSubstring": "$24/user/month",
-      "suggestionContains": "$24",
-      "expectedExtractionTypes": [
-        "fact"
-      ]
+      "suggestionContains": "$24"
     }
   },
   {
@@ -53,10 +50,7 @@
     "output": "Atlas offers seamless Slack integration for your whole team.",
     "expected": {
       "shouldFlag": true,
-      "matchSubstring": "Slack",
-      "expectedExtractionTypes": [
-        "prohibition"
-      ]
+      "matchSubstring": "Slack"
     }
   },
   {
@@ -76,10 +70,7 @@
     "output": "Atlas guarantees significant productivity improvements from day one.",
     "expected": {
       "shouldFlag": true,
-      "matchSubstring": "guarantee",
-      "expectedExtractionTypes": [
-        "prohibition"
-      ]
+      "matchSubstring": "guarantee"
     }
   },
   {
@@ -171,9 +162,6 @@
       "shouldFlag": true,
       "expectedTypes": [
         "format_violation"
-      ],
-      "expectedExtractionTypes": [
-        "fact"
       ]
     }
   },
@@ -358,9 +346,6 @@
       "expectedTypes": [
         "missing_requirement",
         "requirement_violation"
-      ],
-      "expectedExtractionTypes": [
-        "quantity"
       ]
     }
   },
@@ -392,9 +377,6 @@
       "expectedTypes": [
         "missing_requirement",
         "requirement_violation"
-      ],
-      "expectedExtractionTypes": [
-        "quantity"
       ]
     }
   },
@@ -407,9 +389,6 @@
       "shouldFlag": true,
       "expectedTypes": [
         "requirement_violation"
-      ],
-      "expectedExtractionTypes": [
-        "quantity"
       ]
     }
   },
@@ -431,9 +410,6 @@
       "shouldFlag": true,
       "expectedTypes": [
         "missing_requirement"
-      ],
-      "expectedExtractionTypes": [
-        "required_content"
       ]
     }
   },
@@ -468,9 +444,6 @@
       "ambiguous": true,
       "expectedTypes": [
         "requirement_violation"
-      ],
-      "expectedExtractionTypes": [
-        "order"
       ]
     }
   },
@@ -492,11 +465,6 @@
       "shouldFlag": true,
       "expectedTypes": [
         "requirement_violation"
-      ],
-      "expectedExtractionTypes": [
-        "prohibition",
-        "fact",
-        "required_content"
       ]
     }
   },
@@ -524,10 +492,7 @@
     "request": "PRODUCT: Atlas. Price: $24/month. Launch: November. Includes advanced reporting.",
     "output": "Atlas costs $24/month and launches in November with advanced reporting included.",
     "expected": {
-      "shouldFlag": false,
-      "expectedExtractionTypes": [
-        "fact"
-      ]
+      "shouldFlag": false
     }
   },
   {
@@ -539,9 +504,6 @@
       "shouldFlag": true,
       "expectedTypes": [
         "format_violation"
-      ],
-      "expectedExtractionTypes": [
-        "format"
       ]
     }
   },
@@ -568,10 +530,6 @@
       "shouldFlag": true,
       "expectedTypes": [
         "requirement_violation"
-      ],
-      "expectedExtractionTypes": [
-        "quantity",
-        "prohibition"
       ]
     }
   },
@@ -682,11 +640,6 @@
       "expectedTypes": [
         "requirement_violation",
         "missing_requirement"
-      ],
-      "expectedExtractionTypes": [
-        "required_content",
-        "prohibition",
-        "fact"
       ]
     }
   },
@@ -696,11 +649,7 @@
     "request": "Write a one-paragraph investor update using the figures below. Keep it under 60 words.\n\nQ3 revenue: $8.42 million. Q3 operating margin: 42%. The company's fiscal year ends in December.",
     "output": "Q3 revenue reached $8.42 million with an operating margin of 42%. The fiscal year ends in December, as always.",
     "expected": {
-      "shouldFlag": false,
-      "expectedExtractionTypes": [
-        "length",
-        "fact"
-      ]
+      "shouldFlag": false
     }
   }
 ]

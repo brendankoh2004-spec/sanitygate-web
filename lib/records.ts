@@ -5,7 +5,7 @@
  * Rows written by earlier pipeline versions are normalised on read.
  */
 import {
-  CheckRecord, PipelineResult, AdditionalChecks, Finding, FindingCategory, RequirementItem,
+  CheckRecord, PipelineResult, AdditionalChecks, Finding, FindingCategory, FINDING_CATEGORIES, FindingOrigin,
   CheckStatus, IncompleteReason, DEFAULT_ADDITIONAL, sanitizeAdditional, PipelineDiagnostics,
 } from './types';
 
@@ -16,7 +16,6 @@ export interface DbCheckRow {
   request: string;
   output: string;
   additional: AdditionalChecks;
-  extracted_requirements: RequirementItem[];
   findings: Finding[];
   passed_checks: string[];
   word_count: number;
@@ -29,7 +28,7 @@ export interface DbCheckRow {
 
 /** Every column of `checks` the application writes. Verified against db/schema.sql by test/persistence.test.ts. */
 export const CHECKS_WRITE_COLUMNS: (keyof DbCheckRow)[] = [
-  'id', 'session_id', 'created_at', 'request', 'output', 'additional', 'extracted_requirements', 'findings',
+  'id', 'session_id', 'created_at', 'request', 'output', 'additional', 'findings',
   'passed_checks', 'word_count', 'duration_ms', 'semantic_error', 'has_reference', 'check_status', 'diagnostics',
 ];
 
@@ -37,7 +36,7 @@ export function toClientRecord(base: { id: string; sessionId: string; createdAt:
   return {
     ...base,
     findings: r.findings, passedChecks: r.passedChecks, wordCount: r.wordCount, durationMs: r.durationMs,
-    hasReference: r.hasReference, requirements: r.requirements, checkStatus: r.checkStatus, incompleteReason: r.incompleteReason,
+    hasReference: r.hasReference, checkStatus: r.checkStatus, incompleteReason: r.incompleteReason,
   };
 }
 
@@ -45,14 +44,14 @@ export function toClientRecord(base: { id: string; sessionId: string; createdAt:
 export function toDbRow(rec: CheckRecord, r: PipelineResult): DbCheckRow {
   return {
     id: rec.id, session_id: rec.sessionId, created_at: rec.createdAt, request: rec.request, output: rec.output,
-    additional: rec.additional, extracted_requirements: rec.requirements, findings: rec.findings,
+    additional: rec.additional, findings: rec.findings,
     passed_checks: rec.passedChecks, word_count: rec.wordCount, duration_ms: rec.durationMs,
     semantic_error: r.semanticError, has_reference: rec.hasReference, check_status: rec.checkStatus, diagnostics: r.diagnostics,
   };
 }
 
 // ---------------------------------------------------------------------
-// Legacy normalisation (rows written by the previous pipeline)
+// Legacy normalisation (rows written by previous pipelines)
 // ---------------------------------------------------------------------
 const LEGACY_CATEGORY: Record<string, FindingCategory> = {
   missing_requirement: 'omission', requirement_violation: 'instruction_violation',
@@ -60,20 +59,26 @@ const LEGACY_CATEGORY: Record<string, FindingCategory> = {
   numerical_mismatch: 'factual_contradiction', entity_mismatch: 'factual_contradiction',
   unsupported_claim: 'unsupported_addition', format_violation: 'structural',
 };
-const CATEGORIES: FindingCategory[] = ['instruction_violation', 'factual_contradiction', 'unsupported_addition', 'omission', 'structural'];
+const ORIGINS: readonly FindingOrigin[] = ['deterministic', 'direct', 'coverage', 'reverse', 'legacy'];
 
 export function normalizeFinding(f: any, index: number): Finding | null {
   if (!f || typeof f !== 'object') return null;
   const id = typeof f.id === 'string' && f.id ? f.id : `f${index + 1}`;
-  if (typeof f.category === 'string' && CATEGORIES.includes(f.category)) return { ...f, id } as Finding;   // current shape
+  if (typeof f.category === 'string' && (FINDING_CATEGORIES as readonly string[]).includes(f.category)) {
+    // Current category vocabulary. Origin/verification written by the evaluator/verifier pipeline are mapped to 'legacy'.
+    const origin = ORIGINS.includes(f.origin) ? f.origin : 'legacy';
+    const verification = ['not_applicable', 'adjudicated', 'unadjudicated', 'legacy'].includes(f.verification) ? f.verification : 'legacy';
+    return { ...f, id, origin, verification } as Finding;
+  }
 
-  // legacy shape: { type, matchedText, start, end, evidence, suggestion, needsReview, source, ... }
+  // oldest shape: { type, matchedText, start, end, evidence, suggestion, needsReview, source, ... }
+  if (typeof f.type !== 'string') return null;   // not recognisable as a finding of any generation: drop it, never invent one
   const category = LEGACY_CATEGORY[f.type] || 'instruction_violation';
   const hasSpan = typeof f.start === 'number' && typeof f.end === 'number' && typeof f.matchedText === 'string';
   return {
     id, category, severity: f.severity === 'critical' ? 'critical' : 'warning',
     strength: f.needsReview ? 'uncertain' : 'confirmed',
-    origin: f.source === 'semantic' ? 'evaluator' : 'deterministic', verification: 'not_applicable',
+    origin: f.source === 'semantic' ? 'legacy' : 'deterministic', verification: 'legacy',
     passage: hasSpan ? { start: f.start, end: f.end, text: f.matchedText } : null,
     requirementQuote: typeof f.evidence === 'string' ? f.evidence : null,
     requirement: typeof f.requirement === 'string' ? f.requirement : null,
@@ -81,17 +86,6 @@ export function normalizeFinding(f: any, index: number): Finding | null {
     suggestion: typeof f.suggestion === 'string' ? f.suggestion : null,
     edit: null,            // legacy suggestions were prose, not exact replacements: never auto-apply them
   };
-}
-
-function normalizeRequirements(x: any): RequirementItem[] {
-  if (!Array.isArray(x)) return [];
-  return x.filter(r => r && typeof r === 'object').map((r: any, i: number): RequirementItem => ({
-    id: typeof r.id === 'string' ? r.id : `R${i + 1}`,
-    kind: r.kind === 'fact' || r.type === 'fact' ? 'fact' : r.kind === 'unclassified' ? 'unclassified' : 'instruction',
-    category: typeof r.category === 'string' ? r.category : null,
-    text: typeof r.text === 'string' ? r.text : '', quote: typeof r.quote === 'string' ? r.quote : '',
-    quoteStart: typeof r.quoteStart === 'number' ? r.quoteStart : null, quoteEnd: typeof r.quoteEnd === 'number' ? r.quoteEnd : null,
-  }));
 }
 
 export function reasonFromCode(code: string | null | undefined): IncompleteReason {
@@ -113,7 +107,7 @@ export function fromDbRow(row: any): CheckRecord {
     additional: row.additional && typeof row.additional === 'object' ? sanitizeAdditional(row.additional) : { ...DEFAULT_ADDITIONAL },
     findings, passedChecks: Array.isArray(row.passed_checks) ? row.passed_checks : [],
     wordCount: Number(row.word_count) || 0, durationMs: Number(row.duration_ms) || 0,
-    hasReference: !!row.has_reference, requirements: normalizeRequirements(row.extracted_requirements),
+    hasReference: !!row.has_reference,
     checkStatus: status, incompleteReason: status === 'check_incomplete' ? reasonFromCode(row.semantic_error) : null,
   };
 }

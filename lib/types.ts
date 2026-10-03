@@ -1,54 +1,51 @@
 // =====================================================================
 // SanityGate core types (pilot architecture)
 //
+//   REQUEST + OUTPUT
+//        |-- DIRECT MATCH   --\
+//        |-- COVERAGE TRACE ---+--> flat ERROR POOL --> ADJUDICATOR (only if a reviewer raised an error) --> findings
+//        |-- REVERSE CHECK  --/            ^
+//        |-- DETERMINISTIC  ---------------+      (four parallel branches; PASS is discarded, FAIL joins the pool)
+//
 // Responsibilities:
-//   * deterministic layer  -> only hardcoded structural checks
-//                             (word count, required/forbidden terms, list
-//                             format, leftover placeholders)
-//   * semantic layer       -> everything that needs understanding:
-//                             instruction following, facts, numbers/dates
-//                             in context, contradictions, causal claims
-//   * verifier             -> independent verification + independent scan
+//   * deterministic branch -> everything code can prove (word count, list
+//                             format, required/forbidden terms, placeholders).
+//                             A sibling of the reviewers, never a gate before them.
+//   * semantic reviewers   -> three independent, parallel reads; a PASS is
+//                             discarded, only actual errors enter the pool
+//   * adjudicator          -> resolves the pooled reviewer candidates (confirm /
+//                             reject / consolidate duplicates / categorise / fix).
+//                             It never re-reviews the request and output, and
+//                             never re-judges what code already proved.
 // =====================================================================
-
-// ---------------------------------------------------------------------
-// Requirement ledger — the request split into individually judgeable items
-// ---------------------------------------------------------------------
-export type RequirementKind = 'instruction' | 'fact' | 'unclassified';
-export type RequirementCategory = 'content' | 'prohibition' | 'format' | 'quantity' | 'order' | 'length' | 'other';
-
-export interface RequirementItem {
-  id: string;                          // R1, R2, ... (document order)
-  kind: RequirementKind;               // unclassified = a request sentence extraction did not cover; the evaluator classifies it
-  category: RequirementCategory | null;
-  text: string;                        // concise restatement (facts name what each figure refers to)
-  quote: string;                       // verbatim text from the REQUEST ('' only for the synthetic CTA item)
-  quoteStart: number | null;           // validated span in the request
-  quoteEnd: number | null;
-}
 
 // ---------------------------------------------------------------------
 // Findings
 // ---------------------------------------------------------------------
-export type FindingCategory =
-  | 'instruction_violation'   // output breaks/ignores an explicit instruction or prohibition
-  | 'factual_contradiction'   // output states something different from reference information in the request
-  | 'unsupported_addition'    // output asserts something (incl. causal claims) the request does not support
-  | 'unsupported_causal_claim'
-  | 'omission'                // output leaves out something the request required
-  | 'structural';             // deterministic hardcoded check
+/** The ONE definition of what the semantic layer can report. Validators, prompts and persistence all derive from it. */
+export const SEMANTIC_CATEGORIES = [
+  'instruction_violation',    // output breaks/ignores an explicit instruction or prohibition, or does not respond to what the user communicated
+  'factual_contradiction',    // output states something different from reference information in the request
+  'unsupported_addition',     // output asserts a fact/figure/capability the request does not support
+  'omission',                 // output leaves out something the request required or asked
+  'unsupported_causal_claim', // output asserts a causal link the request does not establish (or denies)
+] as const;
+export type SemanticCategory = typeof SEMANTIC_CATEGORIES[number];
+
+export type FindingCategory = SemanticCategory | 'structural';   // structural = deterministic hardcoded check
+export const FINDING_CATEGORIES: readonly FindingCategory[] = [...SEMANTIC_CATEGORIES, 'structural'];
 
 export type Severity = 'critical' | 'warning';
 
-/** Internal provenance — used for testing/debugging/analytics, never shown in the UI. */
-export type FindingOrigin = 'deterministic' | 'evaluator' | 'verifier_scan' | 'evaluator+scan';
+export type SemanticReviewer = 'direct' | 'coverage' | 'reverse';
+
+/** Internal provenance — used for testing/debugging/analytics, never shown in the UI. 'legacy' = row written by an earlier pipeline. */
+export type FindingOrigin = 'deterministic' | SemanticReviewer | 'legacy';
 export type FindingVerification =
-  | 'not_applicable'          // deterministic
-  | 'confirmed'               // verifier independently confirmed with its own grounded evidence
-  | 'uncertain'               // verifier could not decide
-  | 'rejected_corroborated'   // verifier rejected, but an independent scan re-found it
-  | 'unverified'              // verifier did not produce a usable verdict
-  | 'scan_only';              // found only by the independent scan, never seen by the evaluator
+  | 'not_applicable'          // deterministic: proven by code, never adjudicated
+  | 'adjudicated'             // the adjudicator resolved this candidate (see `strength` for the outcome)
+  | 'unadjudicated'           // the adjudicator produced no usable decision for this candidate
+  | 'legacy';                 // row written by an earlier pipeline
 
 /** A targeted change against the ORIGINAL output. Offsets never move. */
 export interface TextEdit {
@@ -64,7 +61,7 @@ export interface Finding {
   id: string;
   category: FindingCategory;
   severity: Severity;
-  /** 'confirmed' = evaluator+verifier (or evaluator+independent scan) agree with grounded evidence. */
+  /** 'confirmed' = proven by code, or confirmed by the adjudicator with evidence grounded in the real text. */
   strength: 'confirmed' | 'uncertain';
   origin: FindingOrigin;
   verification: FindingVerification;
@@ -78,7 +75,7 @@ export interface Finding {
 
 // ---------------------------------------------------------------------
 // Additional checks — deterministic ones only, plus the CTA toggle which is
-// routed to the semantic layer as a requirement.
+// routed to the Coverage Trace reviewer as an extra requirement.
 // ---------------------------------------------------------------------
 export interface AdditionalChecks {
   cta: boolean;
@@ -126,11 +123,12 @@ export function sanitizeAdditional(raw: unknown): AdditionalChecks {
 //   clean            review fully completed, nothing found
 //   findings         review fully completed, at least one confirmed finding
 //   needs_review     review fully completed, everything found is uncertain
-//   check_incomplete some part of the review could not be completed or
-//                    verified. NEVER presented as clean, even with zero findings.
+//   check_incomplete some part of the review could not be completed. NEVER
+//                    presented as clean, even with zero findings.
 // ---------------------------------------------------------------------
 export type CheckStatus = 'clean' | 'findings' | 'needs_review' | 'check_incomplete';
-export type CheckStage = 'analysing' | 'reviewing' | 'verifying' | 'finalising';
+/** Product-facing progress stages. 'confirming' is only emitted when there are candidate errors to adjudicate. */
+export type CheckStage = 'reviewing' | 'confirming' | 'finalising';
 /** The only failure vocabulary the user ever sees. */
 export type IncompleteReason = 'busy' | 'timeout' | 'general';
 
@@ -138,13 +136,16 @@ export type IncompleteReason = 'busy' | 'timeout' | 'general';
 // Internal diagnostics (persisted, never sent to the browser)
 // ---------------------------------------------------------------------
 export interface StageDiagnostic {
-  stage: string;
+  stage: string;           // deterministic | direct | coverage | reverse | adjudicator
   ok: boolean;
   code: string | null;     // rate_limited | timeout | upstream_error | invalid_response | ...
   attempts: number;
-  ms: number;
+  ms: number;              // wall-clock for this stage, all attempts included
   partial: boolean;
   model?: string;
+  promptChars: number;     // size of the prompt sent (chars; ~4 chars per token)
+  maxTokens: number;       // completion budget requested
+  timeoutMs: number;       // effective timeout of the last attempt (0 = skipped before any call)
 }
 export interface PipelineDiagnostics {
   stages: StageDiagnostic[];
@@ -158,7 +159,6 @@ export interface PipelineResult {
   wordCount: number;
   durationMs: number;
   hasReference: boolean;
-  requirements: RequirementItem[];
   checkStatus: CheckStatus;
   incompleteReason: IncompleteReason | null;
   /** Internal failure code (first failing stage). Stored in DB, NOT sent to the browser. */
@@ -179,7 +179,6 @@ export interface CheckRecord {
   wordCount: number;
   durationMs: number;
   hasReference: boolean;
-  requirements: RequirementItem[];
   checkStatus: CheckStatus;
   incompleteReason: IncompleteReason | null;
 }

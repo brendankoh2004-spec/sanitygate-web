@@ -8,7 +8,7 @@
  *   - leftover template placeholders
  *
  * Numbers, percentages, money, dates, contradictions, causal claims, "is this
- * a valid paraphrase" — all of that is owned by the semantic layer
+ * a valid paraphrase" — all of that is owned by the semantic reviewers
  * (lib/semantic.ts). Do not add such checks here.
  */
 import { Finding, AdditionalChecks } from '../types';
@@ -158,7 +158,7 @@ export function runDeterministic(output: string, adv: AdditionalChecks): Determi
   return { findings, passed, wordCount: wc };
 }
 
-/** Programmatic list-item count, handed to the semantic evaluator as a measured fact. */
+/** Programmatic list-item count, handed to the semantic reviewers as a measured fact so no model ever counts. */
 export function countListItems(text: string): number {
   const bullets = text.match(/(^|\n)\s*[-*\u2022]\s+\S/g) || [];
   const numbered = text.match(/(^|\n)\s*\d+[.)]\s+\S/g) || [];

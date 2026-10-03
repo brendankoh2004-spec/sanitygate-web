@@ -5,6 +5,7 @@ import { getSupabase } from '@/lib/supabase';
 import { checkRateLimit, getClientIp } from '@/lib/rateLimit';
 import { sanitizeAdditional } from '@/lib/types';
 import { processCheck } from '@/lib/checkService';
+import { DbCheckRow } from '@/lib/records';
 import { encodeEvent, StreamEvent } from '@/lib/stream';
 
 export const runtime = 'nodejs';
@@ -42,7 +43,7 @@ export async function POST(req: NextRequest) {
   } catch { /* handled by the pipeline as incomplete */ }
 
   const supabase = getSupabase();
-  const persist = async (row: Record<string, unknown>): Promise<boolean> => {
+  const persist = async (row: DbCheckRow): Promise<boolean> => {
     if (!supabase) return false;
     const { error } = await supabase.from('checks').insert(row);
     if (error) { console.error('[sanitygate:persist] insert failed:', error.message); return false; }
